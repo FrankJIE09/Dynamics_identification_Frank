@@ -8,13 +8,27 @@ Thumbs.db
 *~
 *.tmp
 *.bak
+.vscode/
 
 # Python 缓存
 __pycache__/
 *.pyc
 *.pyo
 
+# LaTeX 编译产物（文档源文件 .tex 建议提交，编译产物不提交）
+docs/*.aux
+docs/*.bbl
+docs/*.blg
+docs/*.log
+docs/*.out
+docs/*.toc
+docs/*.synctex.gz
+
 # 大体积采集数据（如需纳入版本管理可删除这一行）
 build_outputs/dynamics_identification_data.csv
+
+# 其它运行时临时文件（按需扩展）
+build_outputs/*.tmp
+build_outputs/*.log
 
 
