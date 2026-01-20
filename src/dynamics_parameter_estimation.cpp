@@ -1,0 +1,641 @@
+/**
+ * @file dynamics_parameter_estimation.cpp
+ * @brief 动力学参数辨识计算程序
+ * 
+ * 此程序用于从采集的数据中辨识机器人的动力学参数：
+ * 1. 从CSV文件读取采集的数据
+ * 2. 使用 Pinocchio 计算回归矩阵
+ * 3. 通过最小二乘法求解动力学参数
+ * 4. 验证辨识结果
+ * 5. 保存辨识结果
+ * 
+ * 此示例需要使用xMateModel模型库，请设置编译选项XCORE_USE_XMATE_MODEL=ON
+ * 需要 Pinocchio 库支持
+ *
+ * @copyright Copyright (C) 2024 ROKAE (Beijing) Technology Co., LTD. All Rights Reserved.
+ */
+
+#include <iostream>
+#include <iomanip>
+#include <cmath>
+#include <vector>
+#include <fstream>
+#include <array>
+#include <chrono>
+#include <sstream>
+#include <string>
+#include "Eigen/Geometry"
+#include "Eigen/Dense"
+
+// Pinocchio includes
+#ifdef __has_include
+  #if __has_include("pinocchio/multibody/model.hpp")
+    #include "pinocchio/multibody/model.hpp"
+    #include "pinocchio/multibody/data.hpp"
+    #include "pinocchio/parsers/urdf.hpp"
+    #include "pinocchio/algorithm/joint-configuration.hpp"
+    #include "pinocchio/algorithm/kinematics.hpp"
+    #include "pinocchio/algorithm/compute-all-terms.hpp"
+    #include "pinocchio/algorithm/regressor.hpp"
+    #define PINOCCHIO_AVAILABLE
+  #endif
+#endif
+
+/**
+ * @brief 数据点结构
+ */
+struct DataPoint {
+    std::array<double, 7> q;      // 关节位置 (rad)
+    std::array<double, 7> dq;      // 关节速度 (rad/s)
+    std::array<double, 7> ddq;     // 关节加速度 (rad/s²)
+    std::array<double, 7> tau;    // 关节力矩 (Nm，传感器测量)
+    double timestamp;             // 时间戳 (s)
+};
+
+/**
+ * @brief 从CSV文件读取数据
+ */
+std::vector<DataPoint> loadDataFromCSV(const std::string& filename) {
+    std::vector<DataPoint> data;
+    std::ifstream file(filename);
+    
+    if (!file.is_open()) {
+        std::cerr << "错误: 无法打开文件 " << filename << std::endl;
+        return data;
+    }
+    
+    // 跳过标题行
+    std::string line;
+    std::getline(file, line);
+    
+    // 读取数据
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        
+        std::istringstream iss(line);
+        std::string token;
+        DataPoint point;
+        
+        // 读取时间戳
+        std::getline(iss, token, ',');
+        point.timestamp = std::stod(token);
+        
+        // 读取关节位置
+        for (int i = 0; i < 7; i++) {
+            std::getline(iss, token, ',');
+            point.q[i] = std::stod(token);
+        }
+        
+        // 读取关节速度
+        for (int i = 0; i < 7; i++) {
+            std::getline(iss, token, ',');
+            point.dq[i] = std::stod(token);
+        }
+        
+        // 读取关节加速度
+        for (int i = 0; i < 7; i++) {
+            std::getline(iss, token, ',');
+            point.ddq[i] = std::stod(token);
+        }
+        
+        // 读取关节力矩
+        for (int i = 0; i < 7; i++) {
+            std::getline(iss, token, ',');
+            point.tau[i] = std::stod(token);
+        }
+        
+        data.push_back(point);
+    }
+    
+    file.close();
+    std::cout << "  从文件读取了 " << data.size() << " 个数据点" << std::endl;
+    return data;
+}
+
+/**
+ * @brief 动力学参数辨识主函数
+ */
+void estimateDynamicsParameters(const std::string& data_file, const std::string& urdf_file) {
+#ifdef PINOCCHIO_AVAILABLE
+  // 初始化 Pinocchio 模型
+  std::cout << "\n  初始化 Pinocchio 动力学模型..." << std::endl;
+  
+  pinocchio::Model pinocchio_model;
+  pinocchio::Data pinocchio_data(pinocchio_model);
+  
+  try {
+    pinocchio::urdf::buildModel(urdf_file, pinocchio_model);
+    std::cout << "  Pinocchio 模型加载成功: " << urdf_file << std::endl;
+    std::cout << "  模型自由度: " << pinocchio_model.nq << std::endl;
+    
+    // 设置重力方向
+    Eigen::Matrix3d R_y = Eigen::AngleAxisd(M_PI/2, Eigen::Vector3d::UnitY()).toRotationMatrix();
+    Eigen::Matrix3d R_z = Eigen::AngleAxisd(-M_PI/2, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    Eigen::Matrix3d R_base_to_world = R_z * R_y;
+    Eigen::Vector3d gravity_world(0, 0, -9.81);
+    Eigen::Vector3d gravity_base = R_base_to_world.transpose() * gravity_world;
+    pinocchio_model.gravity.linear() = gravity_base;
+    std::cout << "  重力方向已设置" << std::endl;
+    
+    pinocchio_data = pinocchio::Data(pinocchio_model);
+  } catch (const std::exception& e) {
+    std::cerr << "  错误: Pinocchio 模型加载失败: " << e.what() << std::endl;
+    return;
+  }
+#else
+  std::cerr << "  错误: Pinocchio 库未找到，无法进行动力学辨识" << std::endl;
+  return;
+#endif
+
+  // 从CSV文件加载数据
+  std::cout << "\n  从文件加载数据: " << data_file << std::endl;
+  std::vector<DataPoint> collected_data = loadDataFromCSV(data_file);
+  
+  if (collected_data.empty()) {
+    std::cerr << "  错误: 没有加载到数据" << std::endl;
+    return;
+  }
+
+  // 构造回归矩阵
+  std::cout << "\n========================================" << std::endl;
+  std::cout << "开始构造回归矩阵..." << std::endl;
+  std::cout << "========================================" << std::endl;
+
+  int n_joints = 7;
+  int n_params = 0;  // 将在第一次计算回归矩阵时确定
+  Eigen::VectorXd theta_urdf;  // URDF先验（与回归矩阵列顺序一致的10维惯性参数堆叠）
+  
+#ifdef PINOCCHIO_AVAILABLE
+  std::cout << "  使用Pinocchio回归矩阵计算" << std::endl;
+  // 先计算一次回归矩阵以确定参数数量
+  Eigen::VectorXd q_test(7), dq_test(7), ddq_test(7);
+  q_test.setZero();
+  dq_test.setZero();
+  ddq_test.setZero();
+  try {
+    // Pinocchio的computeJointTorqueRegressor返回回归矩阵的引用
+    auto& Y_test = pinocchio::computeJointTorqueRegressor(
+        pinocchio_model, pinocchio_data, q_test, dq_test, ddq_test);
+    n_params = Y_test.cols();
+    std::cout << "  Pinocchio回归矩阵参数数量: " << n_params << std::endl;
+
+    // 由URDF模型构造对应的参数先验 theta_urdf（每个关节10个惯性参数）
+    // Pinocchio中回归矩阵列与 model.inertias[i].toDynamicParameters() 的堆叠一致。
+    theta_urdf.resize(n_params);
+    theta_urdf.setZero();
+    const int expected_params = 10 * static_cast<int>(pinocchio_model.njoints - 1);
+    if (n_params != expected_params) {
+      std::cerr << "  警告: n_params(" << n_params << ") != 10*(njoints-1)(" << expected_params
+                << ")，无法可靠构造URDF先验theta_urdf，将只做纯最小二乘。" << std::endl;
+      theta_urdf.resize(0);
+    } else {
+      for (pinocchio::JointIndex jid = 1; jid < pinocchio_model.njoints; ++jid) {
+        const auto pi = pinocchio_model.inertias[jid].toDynamicParameters(); // 10x1
+        const int base = 10 * static_cast<int>(jid - 1);
+        theta_urdf.segment(base, 10) = pi;
+      }
+      std::cout << "  已构造URDF先验theta_urdf（维度 " << theta_urdf.size() << "）" << std::endl;
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "  警告: Pinocchio回归矩阵计算失败: " << e.what() << std::endl;
+    std::cerr << "  回退到简化参数集" << std::endl;
+    n_params = 3 * n_joints;  // 21个参数
+  }
+#else
+  // 如果没有Pinocchio，使用简化参数集
+  n_params = 3 * n_joints;  // 21个参数（每个关节3个：惯性、重力、科氏力）
+  std::cout << "  警告: Pinocchio不可用，使用简化参数集" << std::endl;
+#endif
+  
+  Eigen::MatrixXd Y_all;
+  Eigen::VectorXd tau_all;
+  
+  std::cout << "  处理 " << collected_data.size() << " 个数据点..." << std::endl;
+  
+  int processed = 0;
+  
+  for (const auto& point : collected_data) {
+    // 转换为数组格式
+    std::array<double, 7> q_arr = point.q;
+    std::array<double, 7> dq_arr = point.dq;
+    std::array<double, 7> ddq_arr = point.ddq;
+    std::array<double, 7> tau_arr = point.tau;
+    
+    // 转换为Eigen向量（用于Pinocchio）
+    Eigen::VectorXd q_eigen(7), dq_eigen(7), ddq_eigen(7);
+    for (int i = 0; i < 7; i++) {
+      q_eigen(i) = q_arr[i];
+      dq_eigen(i) = dq_arr[i];
+      ddq_eigen(i) = ddq_arr[i];
+    }
+    
+    // 使用Pinocchio计算回归矩阵
+    Eigen::MatrixXd Y(n_joints, n_params);
+    Y.setZero();
+    
+#ifdef PINOCCHIO_AVAILABLE
+    try {
+      // 使用Pinocchio的回归矩阵计算函数（返回回归矩阵的引用）
+      auto& Y_ref = pinocchio::computeJointTorqueRegressor(
+          pinocchio_model, pinocchio_data, q_eigen, dq_eigen, ddq_eigen);
+      Y = Y_ref;  // 复制回归矩阵
+    } catch (const std::exception& e) {
+      std::cerr << "  警告: Pinocchio回归矩阵计算失败: " << e.what() << std::endl;
+      std::cerr << "  跳过该数据点..." << std::endl;
+      continue;
+    }
+#else
+    // 如果没有Pinocchio，使用简化方法（这里需要xMateModel，但为了简化，跳过）
+    std::cerr << "  错误: 需要Pinocchio库" << std::endl;
+    return;
+#endif
+    
+    // 转换为Eigen向量（力矩）
+    Eigen::VectorXd tau(7);
+    for (int i = 0; i < 7; i++) {
+      tau(i) = tau_arr[i];
+    }
+    
+    // 堆叠回归矩阵和力矩向量
+    if (Y_all.rows() == 0) {
+      Y_all = Y;
+      tau_all = tau;
+    } else {
+      // 检查参数数量是否一致
+      if (Y_all.cols() != Y.cols()) {
+        std::cerr << "  错误: 回归矩阵列数不一致！" << std::endl;
+        std::cerr << "  之前: " << Y_all.cols() << ", 现在: " << Y.cols() << std::endl;
+        break;
+      }
+      
+      Eigen::MatrixXd Y_new(Y_all.rows() + n_joints, n_params);
+      Y_new << Y_all, Y;
+      Y_all = Y_new;
+      
+      Eigen::VectorXd tau_new(tau_all.size() + n_joints);
+      tau_new << tau_all, tau;
+      tau_all = tau_new;
+    }
+    
+    processed++;
+    if (processed % 100 == 0) {
+      std::cout << "  已处理: " << processed << " / " << collected_data.size() << std::endl;
+    }
+  }
+  
+  std::cout << "\n  回归矩阵构造完成" << std::endl;
+  std::cout << "  回归矩阵维度: " << Y_all.rows() << " x " << Y_all.cols() << std::endl;
+  std::cout << "  力矩向量维度: " << tau_all.size() << std::endl;
+
+  // 求解参数
+  std::cout << "\n========================================" << std::endl;
+  std::cout << "开始求解动力学参数..." << std::endl;
+  std::cout << "========================================" << std::endl;
+
+  // 使用 SVD 求解（更稳定）
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(
+      Y_all, Eigen::ComputeThinU | Eigen::ComputeThinV);
+  
+  // 设置奇异值阈值
+  double threshold = 1e-6;
+  Eigen::VectorXd singular_values = svd.singularValues();
+  int rank = 0;
+  for (int i = 0; i < singular_values.size(); i++) {
+    if (singular_values(i) > threshold * singular_values(0)) {
+      rank++;
+    }
+  }
+  std::cout << "  回归矩阵的秩: " << rank << " / " << n_params << std::endl;
+  
+  if (rank < n_params) {
+    std::cerr << "  警告: 回归矩阵不满秩，某些参数可能无法辨识" << std::endl;
+    std::cerr << "  建议: 增加激励轨迹的多样性或延长采集时间" << std::endl;
+  }
+
+  // 求解参数（两种解都给出：纯最小二乘 + 带URDF先验的正则化最小二乘）
+  Eigen::VectorXd theta_ls = svd.solve(tau_all);  // 最小范数最小二乘解
+  Eigen::VectorXd theta_estimated = theta_ls;
+
+  double lambda_rel = 1e-3; // 相对正则强度（越大越贴近URDF）
+  if (theta_urdf.size() == n_params) {
+    Eigen::MatrixXd A = Y_all.transpose() * Y_all;
+    Eigen::VectorXd b = Y_all.transpose() * tau_all;
+    const double traceA = A.trace();
+    const double lambda = (traceA > 1e-12) ? (lambda_rel * traceA / static_cast<double>(n_params)) : lambda_rel;
+    A.diagonal().array() += lambda;
+    b += lambda * theta_urdf;
+    theta_estimated = A.ldlt().solve(b);
+    std::cout << "  使用URDF先验的Ridge最小二乘: lambda_rel=" << lambda_rel
+              << ", lambda=" << std::scientific << lambda << std::fixed << std::endl;
+  } else {
+    std::cout << "  未构造URDF先验theta_urdf，使用纯最小二乘解（SVD）" << std::endl;
+  }
+  
+  std::cout << "\n  辨识的动力学参数:" << std::endl;
+#ifdef PINOCCHIO_AVAILABLE
+  // Pinocchio的回归矩阵参数对应最小惯性参数集
+  // 这些参数是物理参数的线性组合，不是直接的物理量
+  std::cout << "  注意: 这些参数是最小惯性参数集的系数，不是直接的物理量" << std::endl;
+  std::cout << "  参数值:" << std::endl;
+  for (int i = 0; i < std::min(n_params, 20); i++) {  // 只打印前20个
+    std::cout << "    theta[" << i << "] = " << std::fixed << std::setprecision(6) 
+              << theta_estimated(i) << std::endl;
+  }
+  if (n_params > 20) {
+    std::cout << "    ... (共 " << n_params << " 个参数)" << std::endl;
+  }
+#endif
+  
+  std::cout << "\n  参数求解完成" << std::endl;
+  std::cout << "  辨识的参数数量: " << theta_estimated.size() << std::endl;
+
+  // 计算拟合误差
+  Eigen::VectorXd tau_predicted = Y_all * theta_estimated;
+  Eigen::VectorXd error = tau_all - tau_predicted;
+  
+  double rmse = std::sqrt(error.squaredNorm() / error.size());
+  double max_error = error.cwiseAbs().maxCoeff();
+  double mean_error = error.cwiseAbs().mean();
+  
+  std::cout << "\n========================================" << std::endl;
+  std::cout << "辨识结果统计:" << std::endl;
+  std::cout << "========================================" << std::endl;
+  std::cout << "  RMSE: " << std::fixed << std::setprecision(4) << rmse << " Nm" << std::endl;
+  std::cout << "  最大误差: " << max_error << " Nm" << std::endl;
+  std::cout << "  平均误差: " << mean_error << " Nm" << std::endl;
+  
+  // 按关节分析误差
+  std::cout << "\n  各关节误差统计 (Nm):" << std::endl;
+  for (int i = 0; i < 7; i++) {
+    // 提取第i个关节的所有误差值（每7个数据点中取第i个）
+    std::vector<double> error_joint_values;
+    for (int j = i; j < error.size(); j += 7) {
+      error_joint_values.push_back(error(j));
+    }
+    
+    // 计算该关节的RMSE
+    double sum_sq = 0.0;
+    for (double e : error_joint_values) {
+      sum_sq += e * e;
+    }
+    double rmse_joint = std::sqrt(sum_sq / error_joint_values.size());
+    std::cout << "    关节 " << (i+1) << ": RMSE = " << std::fixed 
+              << std::setprecision(4) << rmse_joint << std::endl;
+  }
+
+  // 保存辨识结果
+  std::cout << "\n  保存辨识结果..." << std::endl;
+  std::ofstream result_file("dynamics_identification_results.txt");
+  result_file << "动力学参数辨识结果\n";
+  result_file << "==================\n\n";
+  result_file << "辨识时间: " << std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count() << "\n";
+  result_file << "数据点数: " << collected_data.size() << "\n";
+  result_file << "参数数量: " << n_params << "\n\n";
+  result_file << "误差统计:\n";
+  result_file << "  RMSE: " << rmse << " Nm\n";
+  result_file << "  最大误差: " << max_error << " Nm\n";
+  result_file << "  平均误差: " << mean_error << " Nm\n\n";
+  result_file << "求解说明:\n";
+  if (theta_urdf.size() == n_params) {
+    result_file << "  使用URDF先验的Ridge最小二乘（在不满秩/不可辨识方向上更稳定）\n";
+    result_file << "  lambda_rel: " << std::scientific << lambda_rel << std::fixed << "\n\n";
+  } else {
+    result_file << "  使用纯最小二乘（SVD最小范数解）\n\n";
+  }
+  result_file << "辨识的参数值:\n";
+  for (int i = 0; i < theta_estimated.size(); i++) {
+    result_file << "  theta[" << i << "] = " << std::scientific 
+                << std::setprecision(6) << theta_estimated(i) << "\n";
+  }
+  result_file.close();
+  std::cout << "  结果已保存到: dynamics_identification_results.txt" << std::endl;
+
+  // 保存参数到CSV（便于后续使用）
+  std::ofstream param_file("dynamics_parameters.csv");
+  param_file << "parameter_index,value\n";
+  for (int i = 0; i < theta_estimated.size(); i++) {
+    param_file << i << "," << std::scientific << std::setprecision(10) 
+               << theta_estimated(i) << "\n";
+  }
+  param_file.close();
+  std::cout << "  参数已保存到: dynamics_parameters.csv" << std::endl;
+
+  // 额外保存：纯最小二乘解，便于对比
+  std::ofstream param_file_ls("dynamics_parameters_ls.csv");
+  param_file_ls << "parameter_index,value\n";
+  for (int i = 0; i < theta_ls.size(); i++) {
+    param_file_ls << i << "," << std::scientific << std::setprecision(10)
+                  << theta_ls(i) << "\n";
+  }
+  param_file_ls.close();
+  std::cout << "  纯最小二乘参数已保存到: dynamics_parameters_ls.csv" << std::endl;
+
+  // 额外保存：URDF先验参数，便于对比
+  if (theta_urdf.size() == n_params) {
+    std::ofstream param_file_urdf("dynamics_parameters_urdf.csv");
+    param_file_urdf << "parameter_index,value\n";
+    for (int i = 0; i < theta_urdf.size(); i++) {
+      param_file_urdf << i << "," << std::scientific << std::setprecision(10)
+                      << theta_urdf(i) << "\n";
+    }
+    param_file_urdf.close();
+    std::cout << "  URDF先验参数已保存到: dynamics_parameters_urdf.csv" << std::endl;
+  }
+
+#ifdef PINOCCHIO_AVAILABLE
+  // 输出“辨识后的物理参数”（只有当n_params=10*(njoints-1)时才能从theta直接重建每个关节Inertia）
+  if (theta_urdf.size() == n_params) {
+    std::cout << "\n  输出辨识后的物理参数（与URDF对比）..." << std::endl;
+    std::ofstream physical_param_file("dynamics_physical_parameters_identified.txt");
+    physical_param_file << "辨识后的物理参数（由theta重建，与URDF对比）\n";
+    physical_param_file << "========================================\n\n";
+    physical_param_file << "说明:\n";
+    physical_param_file << "1) 本次Y的秩可能小于参数数(n_params)，因此存在不可辨识方向。\n";
+    physical_param_file << "2) 这里采用URDF先验的Ridge最小二乘，在不可辨识方向上更贴近URDF。\n";
+    physical_param_file << "3) theta块(每关节10维)用 pinocchio::Inertia::FromDynamicParameters 重建质量/质心/惯性。\n\n";
+
+    for (pinocchio::JointIndex jid = 1; jid < pinocchio_model.njoints; ++jid) {
+      const int base = 10 * static_cast<int>(jid - 1);
+      const auto pi_urdf = pinocchio_model.inertias[jid].toDynamicParameters();
+      const auto pi_id = theta_estimated.segment(base, 10);
+      const auto inertia_id = pinocchio::Inertia::FromDynamicParameters(pi_id);
+
+      const double m_urdf = pinocchio_model.inertias[jid].mass();
+      const Eigen::Vector3d c_urdf = pinocchio_model.inertias[jid].lever();
+      const Eigen::Matrix3d I_urdf = pinocchio_model.inertias[jid].inertia();
+
+      const double m_id = inertia_id.mass();
+      const Eigen::Vector3d c_id = inertia_id.lever();
+      const Eigen::Matrix3d I_id = inertia_id.inertia();
+
+      physical_param_file << "关节 " << jid << " (" << pinocchio_model.names[jid] << "):\n";
+      physical_param_file << "  URDF 质量(kg): " << std::fixed << std::setprecision(6) << m_urdf
+                          << " | 辨识质量(kg): " << m_id << "\n";
+      physical_param_file << "  URDF 质心(m): [" << c_urdf(0) << ", " << c_urdf(1) << ", " << c_urdf(2) << "]\n";
+      physical_param_file << "  辨识质心(m): [" << c_id(0) << ", " << c_id(1) << ", " << c_id(2) << "]\n";
+      physical_param_file << "  URDF 惯性(kg·m²):\n";
+      physical_param_file << "    [" << I_urdf(0,0) << ", " << I_urdf(0,1) << ", " << I_urdf(0,2) << "]\n";
+      physical_param_file << "    [" << I_urdf(1,0) << ", " << I_urdf(1,1) << ", " << I_urdf(1,2) << "]\n";
+      physical_param_file << "    [" << I_urdf(2,0) << ", " << I_urdf(2,1) << ", " << I_urdf(2,2) << "]\n";
+      physical_param_file << "  辨识 惯性(kg·m²):\n";
+      physical_param_file << "    [" << I_id(0,0) << ", " << I_id(0,1) << ", " << I_id(0,2) << "]\n";
+      physical_param_file << "    [" << I_id(1,0) << ", " << I_id(1,1) << ", " << I_id(1,2) << "]\n";
+      physical_param_file << "    [" << I_id(2,0) << ", " << I_id(2,1) << ", " << I_id(2,2) << "]\n\n";
+    }
+
+    // 简单验证：q=0时的预测力矩
+    Eigen::VectorXd q0(7), dq0(7), ddq0(7);
+    q0.setZero(); dq0.setZero(); ddq0.setZero();
+    auto& Y0 = pinocchio::computeJointTorqueRegressor(pinocchio_model, pinocchio_data, q0, dq0, ddq0);
+    const Eigen::VectorXd tau0 = Y0 * theta_estimated;
+    physical_param_file << "========================================\n";
+    physical_param_file << "验证：q=0,dq=0,ddq=0 时预测力矩(Nm):\n";
+    physical_param_file << "  [" << std::fixed << std::setprecision(4)
+                        << tau0(0) << ", " << tau0(1) << ", " << tau0(2) << ", "
+                        << tau0(3) << ", " << tau0(4) << ", " << tau0(5) << ", "
+                        << tau0(6) << "]\n";
+    physical_param_file.close();
+    std::cout << "  已保存: dynamics_physical_parameters_identified.txt" << std::endl;
+  } else {
+    std::cout << "\n  跳过物理参数重建：当前theta不是每关节10维惯性参数形式（n_params=" << n_params << "）。" << std::endl;
+  }
+  
+  // 同时更新结果文件，添加物理参数说明
+  std::ofstream result_file_append("dynamics_identification_results.txt", std::ios::app);
+  result_file_append << "\n========================================\n";
+  result_file_append << "物理参数说明:\n";
+  result_file_append << "========================================\n";
+  result_file_append << "1) 若回归矩阵不满秩(rank < n_params)，则存在不可辨识方向，参数解不唯一。\n";
+  result_file_append << "2) 本程序可用URDF先验的Ridge最小二乘在不可辨识方向上稳定解（更贴近URDF）。\n";
+  if (theta_urdf.size() == n_params) {
+    result_file_append << "3) 已输出辨识后的质量/质心/惯性到: dynamics_physical_parameters_identified.txt\n";
+  } else {
+    result_file_append << "3) 当前theta不是10维惯性参数堆叠形式，无法重建质量/质心/惯性\n";
+  }
+  result_file_append.close();
+#endif
+
+  // 验证：使用部分数据验证
+  std::cout << "\n========================================" << std::endl;
+  std::cout << "使用验证数据验证辨识结果..." << std::endl;
+  std::cout << "========================================" << std::endl;
+  
+  // 使用后20%的数据作为验证集
+  int validation_start = static_cast<int>(collected_data.size() * 0.8);
+  int validation_count = collected_data.size() - validation_start;
+  
+  Eigen::MatrixXd Y_val;
+  Eigen::VectorXd tau_val;
+  
+  for (int i = validation_start; i < collected_data.size(); i++) {
+    const auto& point = collected_data[i];
+    std::array<double, 7> q_arr = point.q;
+    std::array<double, 7> dq_arr = point.dq;
+    std::array<double, 7> ddq_arr = point.ddq;
+    std::array<double, 7> tau_arr = point.tau;
+    
+    // 转换为Eigen向量（用于Pinocchio）
+    Eigen::VectorXd q_eigen(7), dq_eigen(7), ddq_eigen(7);
+    for (int j = 0; j < 7; j++) {
+      q_eigen(j) = q_arr[j];
+      dq_eigen(j) = dq_arr[j];
+      ddq_eigen(j) = ddq_arr[j];
+    }
+    
+    // 使用Pinocchio计算回归矩阵（与训练时相同的方法）
+    Eigen::MatrixXd Y(n_joints, n_params);
+    Y.setZero();
+    
+#ifdef PINOCCHIO_AVAILABLE
+    try {
+      // Pinocchio的computeJointTorqueRegressor返回回归矩阵的引用
+      auto& Y_ref = pinocchio::computeJointTorqueRegressor(
+          pinocchio_model, pinocchio_data, q_eigen, dq_eigen, ddq_eigen);
+      Y = Y_ref;  // 复制回归矩阵
+    } catch (const std::exception& e) {
+      continue;  // 跳过失败的数据点
+    }
+#endif
+    
+    // 转换为Eigen向量（力矩）
+    Eigen::VectorXd tau(7);
+    for (int j = 0; j < 7; j++) {
+      tau(j) = tau_arr[j];
+    }
+    
+    if (Y_val.rows() == 0) {
+      Y_val = Y;
+      tau_val = tau;
+    } else {
+      Eigen::MatrixXd Y_new(Y_val.rows() + n_joints, n_params);
+      Y_new << Y_val, Y;
+      Y_val = Y_new;
+      
+      Eigen::VectorXd tau_new(tau_val.size() + n_joints);
+      tau_new << tau_val, tau;
+      tau_val = tau_new;
+    }
+  }
+  
+  Eigen::VectorXd tau_val_predicted = Y_val * theta_estimated;
+  Eigen::VectorXd error_val = tau_val - tau_val_predicted;
+  double rmse_val = std::sqrt(error_val.squaredNorm() / error_val.size());
+  
+  std::cout << "  验证集数据点数: " << validation_count << std::endl;
+  std::cout << "  验证集 RMSE: " << std::fixed << std::setprecision(4) 
+            << rmse_val << " Nm" << std::endl;
+  
+  if (rmse_val < rmse * 1.5) {
+    std::cout << "  ✓ 验证通过：验证误差在合理范围内" << std::endl;
+  } else {
+    std::cout << "  ⚠ 警告：验证误差较大，可能需要更多数据或改进激励轨迹" << std::endl;
+  }
+}
+
+/**
+ * @brief main program
+ */
+int main(int argc, char * argv[])
+{
+  std::cout << "========================================" << std::endl;
+  std::cout << "xCore SDK 动力学参数辨识计算程序" << std::endl;
+  std::cout << "========================================" << std::endl;
+  
+  // 解析命令行参数
+  std::string data_file = "dynamics_identification_data.csv";  // 默认数据文件
+  // 默认URDF文件：优先使用编译期注入的绝对路径，避免运行目录影响
+  std::string urdf_file =
+#ifdef URDF_FILE_PATH
+      URDF_FILE_PATH;
+#else
+      "AR5-5_07R-W4C4A2.urdf";
+#endif
+  
+  if (argc > 1) {
+    data_file = argv[1];
+  }
+  if (argc > 2) {
+    urdf_file = argv[2];
+  }
+  
+  std::cout << "数据文件: " << data_file << std::endl;
+  std::cout << "URDF文件: " << urdf_file << std::endl;
+  std::cout << "========================================" << std::endl;
+  
+  try {
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "开始动力学参数辨识..." << std::endl;
+    std::cout << "========================================" << std::endl;
+    estimateDynamicsParameters(data_file, urdf_file);
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "动力学参数辨识结束" << std::endl;
+    std::cout << "========================================" << std::endl;
+  } catch (const std::exception &e) {
+    std::cerr << "发生异常: " << e.what() << std::endl;
+    return 1;
+  }
+  
+  return 0;
+}
+

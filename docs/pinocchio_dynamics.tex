@@ -1,0 +1,245 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\geometry{margin=2.5cm}
+
+\title{Pinocchio 动力学计算原理}
+\author{xCore SDK 混合力位控制示例}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{概述}
+
+Pinocchio 是一个高效的刚体动力学计算库，用于计算机器人的正向动力学、逆向动力学、雅可比矩阵等。本文档介绍 Pinocchio 如何计算机器人的动力学项，以及这些计算在混合力位控制中的应用。
+
+\section{机器人动力学方程}
+
+机器人的完整动力学方程可以表示为：
+
+\begin{equation}
+\boldsymbol{\tau} = \mathbf{M}(\boldsymbol{q}) \ddot{\boldsymbol{q}} + \mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}}) \dot{\boldsymbol{q}} + \boldsymbol{g}(\boldsymbol{q}) + \boldsymbol{\tau}_f(\boldsymbol{q}, \dot{\boldsymbol{q}})
+\label{eq:dynamics}
+\end{equation}
+
+其中：
+\begin{itemize}
+    \item $\boldsymbol{\tau} \in \mathbb{R}^n$：关节力矩向量（$n$ 为自由度）
+    \item $\boldsymbol{q} \in \mathbb{R}^n$：关节位置向量
+    \item $\dot{\boldsymbol{q}} \in \mathbb{R}^n$：关节速度向量
+    \item $\ddot{\boldsymbol{q}} \in \mathbb{R}^n$：关节加速度向量
+    \item $\mathbf{M}(\boldsymbol{q}) \in \mathbb{R}^{n \times n}$：质量矩阵（惯性矩阵）
+    \item $\mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}}) \in \mathbb{R}^{n \times n}$：科氏力矩阵
+    \item $\boldsymbol{g}(\boldsymbol{q}) \in \mathbb{R}^n$：重力项
+    \item $\boldsymbol{\tau}_f(\boldsymbol{q}, \dot{\boldsymbol{q}}) \in \mathbb{R}^n$：摩擦力项
+\end{itemize}
+
+\section{Pinocchio 的动力学计算}
+
+\subsection{computeAllTerms 函数}
+
+Pinocchio 提供了 \texttt{computeAllTerms()} 函数，可以一次性计算所有动力学项：
+
+\begin{lstlisting}[language=C++, basicstyle=\ttfamily\small]
+pinocchio::computeAllTerms(model, data, q, dq);
+\end{lstlisting}
+
+该函数计算并存储以下内容：
+\begin{itemize}
+    \item \texttt{data.M}：质量矩阵 $\mathbf{M}(\boldsymbol{q})$
+    \item \texttt{data.C}：科氏力矩阵 $\mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}})$
+    \item \texttt{data.g}：重力项 $\boldsymbol{g}(\boldsymbol{q})$
+    \item \texttt{data.nle}：非线性效应项（科氏力+重力）
+\end{itemize}
+
+\subsection{质量矩阵（惯性矩阵）}
+
+质量矩阵 $\mathbf{M}(\boldsymbol{q})$ 表示机器人在当前配置下的惯性特性。它是对称正定矩阵，其元素 $M_{ij}$ 表示关节 $j$ 的加速度对关节 $i$ 的力矩的影响。
+
+在 Pinocchio 中，质量矩阵通过递归算法计算：
+
+\begin{equation}
+\mathbf{M}(\boldsymbol{q}) = \sum_{i=1}^{n} \mathbf{J}_i^T(\boldsymbol{q}) \mathbf{I}_i \mathbf{J}_i(\boldsymbol{q})
+\end{equation}
+
+其中：
+\begin{itemize}
+    \item $\mathbf{J}_i(\boldsymbol{q})$：第 $i$ 个刚体的雅可比矩阵
+    \item $\mathbf{I}_i$：第 $i$ 个刚体的空间惯性矩阵
+\end{itemize}
+
+\subsection{科氏力矩阵}
+
+科氏力矩阵 $\mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}})$ 包含了科氏力和离心力效应。科氏力扭矩为：
+
+\begin{equation}
+\boldsymbol{\tau}_c = \mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}}) \dot{\boldsymbol{q}}
+\end{equation}
+
+在代码中，科氏力扭矩通过以下方式计算：
+
+\begin{lstlisting}[language=C++, basicstyle=\ttfamily\small]
+coriolis_torque_pin = coriolis_pin * dq_pin;
+\end{lstlisting}
+
+科氏力矩阵的计算基于质量矩阵的导数：
+
+\begin{equation}
+\mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}}) = \frac{1}{2} \left( \frac{\partial \mathbf{M}}{\partial \boldsymbol{q}} \dot{\boldsymbol{q}} + \mathbf{S}(\boldsymbol{q}, \dot{\boldsymbol{q}}) \right)
+\end{equation}
+
+其中 $\mathbf{S}(\boldsymbol{q}, \dot{\boldsymbol{q}})$ 是满足 $\dot{\mathbf{M}} = \mathbf{C} + \mathbf{C}^T$ 的矩阵。
+
+\subsection{重力项}
+
+重力项 $\boldsymbol{g}(\boldsymbol{q})$ 表示重力对各个关节产生的力矩。它通过以下公式计算：
+
+\begin{equation}
+\boldsymbol{g}(\boldsymbol{q}) = \sum_{i=1}^{n} \mathbf{J}_i^T(\boldsymbol{q}) m_i \boldsymbol{g}_0
+\end{equation}
+
+其中：
+\begin{itemize}
+    \item $m_i$：第 $i$ 个刚体的质量
+    \item $\boldsymbol{g}_0$：重力加速度向量（在基座坐标系中）
+\end{itemize}
+
+在代码中，重力方向根据安装位置进行了变换：
+
+\begin{lstlisting}[language=C++, basicstyle=\ttfamily\small]
+// 安装位置：外旋 XYZ = 0 90 -90
+Eigen::Matrix3d R_y = Eigen::AngleAxisd(M_PI/2, 
+    Eigen::Vector3d::UnitY()).toRotationMatrix();
+Eigen::Matrix3d R_z = Eigen::AngleAxisd(-M_PI/2, 
+    Eigen::Vector3d::UnitZ()).toRotationMatrix();
+Eigen::Matrix3d R_base_to_world = R_z * R_y;
+Eigen::Vector3d gravity_world(0, 0, -9.81);
+Eigen::Vector3d gravity_base = R_base_to_world.transpose() * gravity_world;
+pinocchio_model.gravity.linear() = gravity_base;
+\end{lstlisting}
+
+\subsection{惯性力项}
+
+惯性力项表示由于关节加速度产生的力矩：
+
+\begin{equation}
+\boldsymbol{\tau}_I = \mathbf{M}(\boldsymbol{q}) \ddot{\boldsymbol{q}}
+\end{equation}
+
+在代码中计算为：
+
+\begin{lstlisting}[language=C++, basicstyle=\ttfamily\small]
+inertia_torque_pin = mass_pin * ddq_pin;
+\end{lstlisting}
+
+\section{完整动力学项的计算}
+
+在代码中，Pinocchio 计算的各项与动力学方程的关系如下：
+
+\begin{align}
+\boldsymbol{\tau}_{\text{full}} &= \boldsymbol{\tau}_I + \boldsymbol{\tau}_c + \boldsymbol{g} \\
+&= \mathbf{M}(\boldsymbol{q}) \ddot{\boldsymbol{q}} + \mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}}) \dot{\boldsymbol{q}} + \boldsymbol{g}(\boldsymbol{q})
+\end{align}
+
+对应代码：
+
+\begin{lstlisting}[language=C++, basicstyle=\ttfamily\small]
+// 计算所有动力学项
+pinocchio::computeAllTerms(pinocchio_model, pinocchio_data, q_pin, dq_pin);
+
+// 获取各项
+gravity_pin = pinocchio_data.g;  // 重力项
+coriolis_pin = pinocchio_data.C;  // 科氏力矩阵
+mass_pin = pinocchio_data.M;  // 质量矩阵
+coriolis_torque_pin = coriolis_pin * dq_pin;  // 科氏力扭矩
+inertia_torque_pin = mass_pin * ddq_pin;  // 惯性力扭矩
+\end{lstlisting}
+
+\section{负载处理}
+
+在代码中，KWR75 力传感器的负载被添加到末端执行器：
+
+\begin{lstlisting}[language=C++, basicstyle=\ttfamily\small]
+// 创建负载惯性
+Eigen::Vector3d load_com(load_centre[0], load_centre[1], load_centre[2]);
+Eigen::Matrix3d inertia_matrix = Eigen::Matrix3d::Zero();
+inertia_matrix(0, 0) = load_inertia[0];  // Ixx
+inertia_matrix(1, 1) = load_inertia[1];  // Iyy
+inertia_matrix(2, 2) = load_inertia[2];  // Izz
+pinocchio::Inertia load_inertia_pin(load_mass, load_com, inertia_matrix);
+
+// 将负载添加到末端执行器 joint 的惯性
+pinocchio_model.inertias[ee_joint_id] += load_inertia_pin;
+\end{lstlisting}
+
+负载的惯性矩阵 $\mathbf{I}_{\text{load}}$ 为：
+
+\begin{equation}
+\mathbf{I}_{\text{load}} = \begin{bmatrix}
+I_{xx} & 0 & 0 \\
+0 & I_{yy} & 0 \\
+0 & 0 & I_{zz}
+\end{bmatrix}
+\end{equation}
+
+其中 $I_{xx}$、$I_{yy}$、$I_{zz}$ 是主惯量（假设负载的主轴与坐标系对齐）。
+
+\section{计算效率}
+
+Pinocchio 使用高效的递归算法（基于 Featherstone 的算法）计算动力学项，计算复杂度为 $O(n)$，其中 $n$ 是机器人的自由度。这使得它非常适合实时控制应用。
+
+\section{与 xMateModel 的对比}
+
+在混合力位控制代码中，Pinocchio 的计算结果与 xMateModel 的计算结果进行对比：
+
+\begin{align}
+\Delta \boldsymbol{g} &= \boldsymbol{g}_{\text{xMate}} - \boldsymbol{g}_{\text{Pinocchio}} \\
+\Delta \boldsymbol{\tau}_c &= \boldsymbol{\tau}_{c,\text{xMate}} - \boldsymbol{\tau}_{c,\text{Pinocchio}} \\
+\Delta \boldsymbol{\tau}_I &= \boldsymbol{\tau}_{I,\text{xMate}} - \boldsymbol{\tau}_{I,\text{Pinocchio}} \\
+\Delta \boldsymbol{\tau}_{\text{full}} &= \boldsymbol{\tau}_{\text{full,xMate}} - \boldsymbol{\tau}_{\text{full,Pinocchio}}
+\end{align}
+
+这些差值可以帮助验证：
+\begin{itemize}
+    \item 模型参数的一致性（质量、惯性、质心位置）
+    \item 重力方向的设置是否正确
+    \item 负载参数是否正确添加
+    \item 数值计算的精度
+\end{itemize}
+
+\section{总结}
+
+Pinocchio 提供了高效的动力学计算功能，通过 \texttt{computeAllTerms()} 函数可以一次性计算：
+\begin{itemize}
+    \item 质量矩阵 $\mathbf{M}(\boldsymbol{q})$
+    \item 科氏力矩阵 $\mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}})$
+    \item 重力项 $\boldsymbol{g}(\boldsymbol{q})$
+\end{itemize}
+
+这些项可以进一步组合得到：
+\begin{itemize}
+    \item 惯性力扭矩：$\boldsymbol{\tau}_I = \mathbf{M} \ddot{\boldsymbol{q}}$
+    \item 科氏力扭矩：$\boldsymbol{\tau}_c = \mathbf{C} \dot{\boldsymbol{q}}$
+    \item 总动力学扭矩：$\boldsymbol{\tau}_{\text{full}} = \boldsymbol{\tau}_I + \boldsymbol{\tau}_c + \boldsymbol{g}$
+\end{itemize}
+
+在混合力位控制中，这些计算结果用于：
+\begin{enumerate}
+    \item 验证 xMateModel 的计算结果
+    \item 调试动力学模型参数
+    \item 分析控制性能
+\end{enumerate}
+
+\end{document}
+
+

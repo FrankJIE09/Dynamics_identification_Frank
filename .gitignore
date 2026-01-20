@@ -1,0 +1,20 @@
+# 归档目录的 gitignore（建议：保留源码/URDF/结果，忽略大文件与临时文件）
+
+# OS / 编辑器临时文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 大体积采集数据（如需纳入版本管理可删除这一行）
+build_outputs/dynamics_identification_data.csv
+
+

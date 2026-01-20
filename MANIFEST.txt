@@ -1,0 +1,41 @@
+dynamics identification archive
+created: 2026-01-20
+
+[src]
+总计 112
+drwxrwxr-x 2 lenovo lenovo  4096 Jan 20 15:31 .
+drwxrwxr-x 6 lenovo lenovo  4096 Jan 20 15:31 ..
+-rw-rw-rw- 1 lenovo lenovo 14456 Jan 20 14:41 CMakeLists_rt.txt
+-rw-rw-r-- 1 lenovo lenovo 16106 Jan 20 14:41 dynamics_data_collection.cpp
+-rw-rw-r-- 1 lenovo lenovo 42194 Jan 20 14:35 dynamics_identification.cpp
+-rw-rw-r-- 1 lenovo lenovo 26254 Jan 20 14:58 dynamics_parameter_estimation.cpp
+
+[urdf]
+总计 72
+drwxrwxr-x 2 lenovo lenovo  4096 Jan 20 15:31 .
+drwxrwxr-x 6 lenovo lenovo  4096 Jan 20 15:31 ..
+-rw-rw-r-- 1 lenovo lenovo 12469 Jan 20 15:14 AR5-5_07R-W4C4A2_identified_direct_from_txt.urdf
+-rw-rw-r-- 1 lenovo lenovo 12772 Jan 20 15:04 AR5-5_07R-W4C4A2_identified.urdf
+-rw-rw-r-- 1 lenovo lenovo 12684 Jan 16 17:29 AR5-5_07R-W4C4A2.urdf
+-rw-rw-r-- 1 lenovo lenovo 12957 Jan 20 15:07 generate_identified_urdf.py
+
+[build_outputs]
+总计 1660
+drwxrwxr-x 2 lenovo lenovo    4096 Jan 20 15:31 .
+drwxrwxr-x 6 lenovo lenovo    4096 Jan 20 15:31 ..
+-rw-rw-r-- 1 lenovo lenovo 1666844 Jan 20 14:36 dynamics_identification_data.csv
+-rw-rw-r-- 1 lenovo lenovo    2652 Jan 20 14:58 dynamics_identification_results.txt
+-rw-rw-r-- 1 lenovo lenovo    1435 Jan 20 14:58 dynamics_parameters.csv
+-rw-rw-r-- 1 lenovo lenovo    1435 Jan 20 14:58 dynamics_parameters_ls.csv
+-rw-rw-r-- 1 lenovo lenovo    1429 Jan 20 14:58 dynamics_parameters_urdf.csv
+-rw-rw-r-- 1 lenovo lenovo    3770 Jan 20 14:58 dynamics_physical_parameters_identified.txt
+-rw-rw-r-- 1 lenovo lenovo    3494 Jan 20 14:37 dynamics_physical_parameters.txt
+
+[docs]
+总计 96
+drwxrwxr-x 2 lenovo lenovo  4096 Jan 20 15:31 .
+drwxrwxr-x 6 lenovo lenovo  4096 Jan 20 15:31 ..
+-rw-rw-r-- 1 lenovo lenovo 29436 Jan 20 11:54 pinocchio_dual_arm_dynamics.tex
+-rw-rw-r-- 1 lenovo lenovo 18391 Jan 20 13:22 pinocchio_dynamics_identification.tex
+-rw-rw-r-- 1 lenovo lenovo  9218 Jan 19 18:16 pinocchio_dynamics.tex
+-rw-rw-r-- 1 lenovo lenovo 20866 Jan 20 13:22 pinocchio_kinematic_identification.tex
