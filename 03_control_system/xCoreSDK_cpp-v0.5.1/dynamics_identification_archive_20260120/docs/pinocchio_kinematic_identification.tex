@@ -1,0 +1,653 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\geometry{margin=2.5cm}
+
+\title{Pinocchio 运动学参数辨识详解}
+\author{基于 hybrid\_force\_position\_control.cpp 和 xCore SDK}
+\date{\today}
+
+\lstset{
+    language=C++,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{green!60!black},
+    stringstyle=\color{red},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    stepnumber=1,
+    numbersep=5pt,
+    frame=single,
+    breaklines=true,
+    showspaces=false,
+    showstringspaces=false,
+    tabsize=2
+}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+\newpage
+
+\section{概述}
+
+运动学参数辨识是机器人标定的重要环节，通过实验数据估计机器人的几何参数（连杆长度、关节偏置、关节轴方向等），以提高定位精度。本文档介绍如何使用 Pinocchio 库进行运动学参数辨识。
+
+\section{运动学辨识的基本原理}
+
+\subsection{待辨识的运动学参数}
+
+对于机器人运动学，需要辨识的参数包括：
+
+\begin{enumerate}
+    \item \textbf{连杆长度：} $a_i$（相邻关节轴之间的最短距离）
+    \item \textbf{连杆扭转角：} $\alpha_i$（相邻关节轴之间的扭转角）
+    \item \textbf{关节偏置：} $d_i$（沿关节轴方向的偏移）
+    \item \textbf{关节角度偏置：} $\theta_{i,0}$（关节零位偏置）
+    \item \textbf{末端执行器位姿：} TCP（Tool Center Point）相对于最后一个关节的位姿
+    \item \textbf{基坐标系位姿：} 机器人基座相对于世界坐标系的位置和姿态
+\end{enumerate}
+
+\subsection{正向运动学模型}
+
+机器人的正向运动学可以表示为：
+
+\begin{equation}
+\mathbf{T}_{ee} = f(\boldsymbol{q}, \boldsymbol{\theta}_k)
+\label{eq:forward_kinematics}
+\end{equation}
+
+其中：
+\begin{itemize}
+    \item $\mathbf{T}_{ee} \in SE(3)$：末端执行器相对于基坐标系的齐次变换矩阵
+    \item $\boldsymbol{q} \in \mathbb{R}^n$：关节角度向量
+    \item $\boldsymbol{\theta}_k \in \mathbb{R}^p$：待辨识的运动学参数向量
+\end{itemize}
+
+\subsection{线性化与回归矩阵}
+
+对于小的参数误差，可以将运动学方程线性化：
+
+\begin{equation}
+\delta \mathbf{x}_{ee} = \mathbf{J}_k(\boldsymbol{q}, \boldsymbol{\theta}_k) \delta \boldsymbol{\theta}_k
+\label{eq:kinematic_regressor}
+\end{equation}
+
+其中：
+\begin{itemize}
+    \item $\delta \mathbf{x}_{ee} \in \mathbb{R}^6$：末端执行器位姿误差（3维位置 + 3维姿态）
+    \item $\mathbf{J}_k \in \mathbb{R}^{6 \times p}$：运动学回归矩阵（Kinematic Regressor）
+    \item $\delta \boldsymbol{\theta}_k$：参数误差
+\end{itemize}
+
+\section{Pinocchio 的运动学辨识功能}
+
+\subsection{核心函数}
+
+Pinocchio 提供了以下关键函数用于运动学辨识：
+
+\begin{lstlisting}[caption=Pinocchio 运动学辨识相关函数]
+// 1. 计算正向运动学
+pinocchio::forwardKinematics(model, data, q);
+pinocchio::updateFramePlacements(model, data);
+
+// 2. 计算末端执行器位姿
+Eigen::Matrix4d T_ee = data.oMf[ee_frame_id].toHomogeneousMatrix();
+
+// 3. 计算运动学回归矩阵（对参数求偏导）
+pinocchio::computeFrameKinematicRegressor(
+    model, data, frame_id, regressor);
+
+// 4. 计算雅可比矩阵（对关节角度求偏导）
+pinocchio::computeFrameJacobian(
+    model, data, q, frame_id, pinocchio::LOCAL_WORLD_ALIGNED, J);
+
+// 5. 计算关节配置的偏导数
+pinocchio::computeJointKinematicRegressor(
+    model, data, joint_id, regressor);
+\end{lstlisting}
+
+\subsection{运动学回归矩阵}
+
+运动学回归矩阵 $\mathbf{J}_k$ 表示末端执行器位姿对运动学参数的敏感度：
+
+\begin{equation}
+\mathbf{J}_k = \frac{\partial \mathbf{x}_{ee}}{\partial \boldsymbol{\theta}_k}
+\end{equation}
+
+每一列对应一个参数的偏导数。
+
+\section{辨识流程}
+
+\subsection{步骤1：数据采集}
+
+需要采集的数据包括：
+
+\begin{lstlisting}[caption=运动学辨识数据采集]
+struct KinematicDataPoint {
+    std::vector<double> q;           // 关节角度 (n维)
+    Eigen::Vector3d pos_measured;    // 末端位置（外部测量，如视觉、激光追踪）
+    Eigen::Quaterniond quat_measured; // 末端姿态（外部测量）
+    double timestamp;                // 时间戳
+};
+
+// 采集多个数据点
+std::vector<KinematicDataPoint> collected_data;
+\end{lstlisting}
+
+\textbf{数据采集要求：}
+\begin{itemize}
+    \item 使用外部测量设备（视觉系统、激光追踪器、测量臂等）
+    \item 覆盖机器人的整个工作空间
+    \item 包含不同的关节角度组合
+    \item 数据量要足够（通常需要数百到数千个数据点）
+    \item 测量精度要足够高（通常要求位置误差 < 0.1mm，姿态误差 < 0.1°）
+\end{itemize}
+
+\subsection{步骤2：构造误差方程}
+
+对于每个数据点，计算预测位姿和测量位姿的误差：
+
+\begin{lstlisting}[caption=构造误差方程]
+// 初始化
+Eigen::MatrixXd J_all;      // 所有回归矩阵堆叠
+Eigen::VectorXd error_all;   // 所有位姿误差堆叠
+
+for (const auto& point : collected_data) {
+    // 1. 使用当前参数计算正向运动学
+    Eigen::VectorXd q = Eigen::Map<const Eigen::VectorXd>(
+        point.q.data(), point.q.size());
+    
+    pinocchio::forwardKinematics(model, data, q);
+    pinocchio::updateFramePlacements(model, data);
+    
+    // 2. 获取预测的末端执行器位姿
+    Eigen::Matrix4d T_predicted = 
+        data.oMf[ee_frame_id].toHomogeneousMatrix();
+    Eigen::Vector3d pos_predicted = T_predicted.block<3,1>(0,3);
+    Eigen::Matrix3d R_predicted = T_predicted.block<3,3>(0,0);
+    Eigen::Quaterniond quat_predicted(R_predicted);
+    
+    // 3. 计算位姿误差
+    Eigen::Vector3d pos_error = point.pos_measured - pos_predicted;
+    
+    // 姿态误差（使用旋转向量）
+    Eigen::Quaterniond quat_error = 
+        point.quat_measured * quat_predicted.inverse();
+    if (quat_error.w() < 0) {
+        quat_error.coeffs() = -quat_error.coeffs();
+    }
+    Eigen::Vector3d rot_error = quat_error.vec();
+    
+    // 组合成6维误差向量
+    Eigen::VectorXd error(6);
+    error.head(3) = rot_error;      // 姿态误差
+    error.tail(3) = pos_error;      // 位置误差
+    
+    // 4. 计算运动学回归矩阵
+    Eigen::MatrixXd J_k(6, n_params);
+    pinocchio::computeFrameKinematicRegressor(
+        model, data, ee_frame_id, J_k);
+    
+    // 5. 堆叠
+    if (J_all.rows() == 0) {
+        J_all = J_k;
+        error_all = error;
+    } else {
+        Eigen::MatrixXd J_new(J_all.rows() + 6, n_params);
+        J_new << J_all, J_k;
+        J_all = J_new;
+        
+        Eigen::VectorXd error_new(error_all.size() + 6);
+        error_new << error_all, error;
+        error_all = error_new;
+    }
+}
+\end{lstlisting}
+
+\subsection{步骤3：求解参数}
+
+使用最小二乘法求解参数误差：
+
+\begin{equation}
+\delta \hat{\boldsymbol{\theta}}_k = (\mathbf{J}_k^T \mathbf{J}_k)^{-1} \mathbf{J}_k^T \boldsymbol{\epsilon}
+\label{eq:kinematic_least_squares}
+\end{equation}
+
+其中 $\boldsymbol{\epsilon}$ 是所有位姿误差的堆叠向量。
+
+\begin{lstlisting}[caption=求解运动学参数]
+// 求解参数误差
+Eigen::VectorXd delta_theta = 
+    (J_all.transpose() * J_all).ldlt().solve(
+        J_all.transpose() * error_all);
+
+// 更新参数
+Eigen::VectorXd theta_new = theta_initial + delta_theta;
+
+// 更新模型
+updateModelKinematicParameters(model, theta_new);
+\end{lstlisting}
+
+\subsection{步骤4：迭代优化}
+
+由于运动学方程是非线性的，通常需要迭代优化：
+
+\begin{lstlisting}[caption=迭代优化]
+Eigen::VectorXd theta = theta_initial;
+double tolerance = 1e-6;
+int max_iterations = 100;
+
+for (int iter = 0; iter < max_iterations; iter++) {
+    // 1. 计算当前参数下的误差
+    Eigen::MatrixXd J_all;
+    Eigen::VectorXd error_all;
+    constructErrorEquations(model, data, collected_data, 
+                           J_all, error_all);
+    
+    // 2. 计算参数更新
+    Eigen::VectorXd delta_theta = 
+        (J_all.transpose() * J_all + lambda * I).ldlt().solve(
+            J_all.transpose() * error_all);
+    
+    // 3. 更新参数
+    theta += delta_theta;
+    updateModelKinematicParameters(model, theta);
+    
+    // 4. 检查收敛
+    if (delta_theta.norm() < tolerance) {
+        std::cout << "收敛于迭代 " << iter << std::endl;
+        break;
+    }
+}
+\end{lstlisting}
+
+\section{单臂系统运动学辨识}
+
+\subsection{DH 参数辨识}
+
+对于使用 DH（Denavit-Hartenberg）参数描述的机器人，需要辨识：
+
+\begin{equation}
+\boldsymbol{\theta}_k = [a_1, \alpha_1, d_1, \theta_{1,0}, \ldots, a_n, \alpha_n, d_n, \theta_{n,0}]^T
+\end{equation}
+
+\subsection{代码示例}
+
+\begin{lstlisting}[caption=单臂系统运动学辨识]
+void identifySingleArmKinematics(
+    pinocchio::Model& model,
+    const std::vector<KinematicDataPoint>& data) {
+    
+    pinocchio::Data data_pin(model);
+    int ee_frame_id = model.getFrameId("end_effector");
+    int n_params = getKinematicParameterCount(model);
+    
+    // 初始化参数
+    Eigen::VectorXd theta = getInitialKinematicParameters(model);
+    
+    // 迭代优化
+    for (int iter = 0; iter < 100; iter++) {
+        Eigen::MatrixXd J_all;
+        Eigen::VectorXd error_all;
+        
+        // 对每个数据点
+        for (const auto& point : data) {
+            Eigen::VectorXd q(point.q.size());
+            for (size_t i = 0; i < point.q.size(); i++) {
+                q(i) = point.q[i];
+            }
+            
+            // 更新模型参数
+            updateModelWithParameters(model, theta);
+            
+            // 计算正向运动学
+            pinocchio::forwardKinematics(model, data_pin, q);
+            pinocchio::updateFramePlacements(model, data_pin);
+            
+            // 计算误差
+            Eigen::Matrix4d T_pred = 
+                data_pin.oMf[ee_frame_id].toHomogeneousMatrix();
+            Eigen::Vector3d pos_pred = T_pred.block<3,1>(0,3);
+            Eigen::Matrix3d R_pred = T_pred.block<3,3>(0,0);
+            
+            Eigen::Vector3d pos_error = point.pos_measured - pos_pred;
+            Eigen::Quaterniond quat_pred(R_pred);
+            Eigen::Quaterniond quat_err = 
+                point.quat_measured * quat_pred.inverse();
+            Eigen::Vector3d rot_error = quat_err.vec();
+            
+            Eigen::VectorXd error(6);
+            error.head(3) = rot_error;
+            error.tail(3) = pos_error;
+            
+            // 计算回归矩阵
+            Eigen::MatrixXd J_k(6, n_params);
+            pinocchio::computeFrameKinematicRegressor(
+                model, data_pin, ee_frame_id, J_k);
+            
+            // 堆叠
+            // ...
+        }
+        
+        // 求解参数更新
+        Eigen::VectorXd delta_theta = 
+            (J_all.transpose() * J_all).ldlt().solve(
+                J_all.transpose() * error_all);
+        
+        // 更新参数
+        theta += delta_theta;
+        
+        // 检查收敛
+        if (delta_theta.norm() < 1e-6) break;
+    }
+    
+    // 更新URDF模型
+    updateURDFWithIdentifiedParameters(urdf_path, theta);
+}
+\end{lstlisting}
+
+\section{双臂系统运动学辨识}
+
+\subsection{特殊考虑}
+
+对于双臂系统，需要辨识：
+
+\begin{enumerate}
+    \item \textbf{左臂的运动学参数}
+    \item \textbf{右臂的运动学参数}
+    \item \textbf{双臂之间的相对位姿}（如果双臂不是完全对称）
+    \item \textbf{基座到双臂连接点的位姿}
+\end{enumerate}
+
+\subsection{数据采集策略}
+
+\begin{lstlisting}[caption=双臂系统数据采集]
+// 策略1：分别辨识每个手臂
+// 固定一个手臂，只运动另一个手臂
+std::vector<KinematicDataPoint> left_arm_data;
+std::vector<KinematicDataPoint> right_arm_data;
+
+// 策略2：同时辨识（考虑耦合）
+// 同时运动两个手臂，测量两个末端执行器的位姿
+std::vector<DualArmDataPoint> dual_arm_data;
+
+struct DualArmDataPoint {
+    std::vector<double> q_left, q_right;
+    Eigen::Vector3d pos_left, pos_right;
+    Eigen::Quaterniond quat_left, quat_right;
+};
+\end{lstlisting}
+
+\section{全身系统运动学辨识}
+
+\subsection{包含底盘和腰部的辨识}
+
+对于全身系统，需要辨识：
+
+\begin{enumerate}
+    \item \textbf{底盘位姿：} 相对于世界坐标系
+    \item \textbf{腰部关节参数：} 折叠和旋转关节的几何参数
+    \item \textbf{双臂运动学参数}
+    \item \textbf{各部分的相对位姿}
+\end{enumerate}
+
+\subsection{浮动基座的处理}
+
+如果底盘是浮动的，需要额外考虑：
+
+\begin{lstlisting}[caption=浮动基座运动学辨识]
+// 底盘有6个自由度（位置+姿态）
+// 需要测量底盘在世界坐标系中的位姿
+
+struct FullBodyDataPoint {
+    // 底盘位姿（外部测量，如IMU、视觉等）
+    Eigen::Vector3d base_pos;
+    Eigen::Quaterniond base_quat;
+    
+    // 关节角度
+    std::vector<double> q_torso;  // 腰部关节
+    std::vector<double> q_left;   // 左臂关节
+    std::vector<double> q_right;  // 右臂关节
+    
+    // 末端执行器位姿（外部测量）
+    Eigen::Vector3d pos_left_ee, pos_right_ee;
+    Eigen::Quaterniond quat_left_ee, quat_right_ee;
+};
+\end{lstlisting}
+
+\section{关节零位标定}
+
+\subsection{零位偏置辨识}
+
+关节零位偏置 $\theta_{i,0}$ 是重要的运动学参数，可以通过以下方法辨识：
+
+\begin{lstlisting}[caption=关节零位标定]
+// 方法1：使用已知的参考点
+// 让机器人移动到已知的参考位置，测量关节角度
+Eigen::VectorXd q_measured_at_reference;
+// 参考位置的关节角度应该是 [0, 0, ..., 0]
+// 零位偏置 = q_measured_at_reference
+
+// 方法2：使用外部测量设备
+// 测量多个已知位置的末端执行器位姿
+// 通过优化求解零位偏置
+void calibrateJointZeros(
+    pinocchio::Model& model,
+    const std::vector<ReferencePoint>& reference_points) {
+    
+    // 参考点：已知的末端执行器位姿
+    struct ReferencePoint {
+        Eigen::Vector3d pos;
+        Eigen::Quaterniond quat;
+        Eigen::VectorXd q_measured;  // 测量到的关节角度
+    };
+    
+    // 优化目标：最小化预测位姿与参考位姿的误差
+    // 变量：关节零位偏置
+    // ...
+}
+\end{lstlisting}
+
+\section{TCP 标定}
+
+\subsection{工具中心点标定}
+
+TCP（Tool Center Point）标定是运动学辨识的重要部分：
+
+\begin{lstlisting}[caption=TCP标定]
+// 使用 xCore SDK 的标定功能
+error_code ec;
+std::vector<std::array<double, 7>> calibration_points;
+
+// 采集多个标定点
+for (int i = 0; i < 6; i++) {
+    // 移动到不同的姿态
+    robot.MoveJ(...);
+    auto q = robot.jointPos(ec);
+    calibration_points.push_back(q);
+}
+
+// 执行TCP标定
+auto result = robot.calibrateFrame(
+    FrameType::tool, 
+    calibration_points, 
+    true,  // 机器人手持
+    ec);
+
+if (!ec) {
+    std::cout << "TCP标定成功" << std::endl;
+    std::cout << "TCP位姿: " << result.transformation << std::endl;
+}
+\end{lstlisting}
+
+\section{基坐标系标定}
+
+\subsection{基坐标系辨识}
+
+基坐标系标定确定机器人基座相对于世界坐标系的位置和姿态：
+
+\begin{lstlisting}[caption=基坐标系标定]
+// 使用 xCore SDK 的基坐标系标定
+error_code ec;
+std::vector<std::array<double, 7>> calibration_points;
+std::array<double, 3> base_aux = {0, 0, 0};  // 辅助点
+
+// 采集6个标定点
+for (int i = 0; i < 6; i++) {
+    robot.MoveJ(...);
+    auto q = robot.jointPos(ec);
+    calibration_points.push_back(q);
+}
+
+// 执行基坐标系标定
+auto result = robot.calibrateFrame(
+    FrameType::base,
+    calibration_points,
+    false,  // 外部标定
+    ec,
+    base_aux);
+
+if (!ec) {
+    std::cout << "基坐标系标定成功" << std::endl;
+    // 标定结果会自动保存到控制器
+}
+\end{lstlisting}
+
+\section{实际应用中的注意事项}
+
+\subsection{测量设备}
+
+\begin{itemize}
+    \item \textbf{视觉系统：} 使用相机和标记点（如 ArUco、AprilTag）
+    \item \textbf{激光追踪器：} 高精度的位置测量（精度可达 0.01mm）
+    \item \textbf{测量臂：} 便携式坐标测量机
+    \item \textbf{IMU：} 用于测量姿态（特别是浮动基座）
+\end{itemize}
+
+\subsection{数据同步}
+
+\begin{lstlisting}[caption=数据同步]
+// 确保关节角度和外部测量数据时间同步
+struct SynchronizedData {
+    double timestamp;
+    std::vector<double> q;
+    Eigen::Vector3d pos_external;
+    Eigen::Quaterniond quat_external;
+};
+
+// 使用时间戳对齐数据
+void synchronizeData(
+    const std::vector<JointData>& joint_data,
+    const std::vector<ExternalMeasurement>& external_data) {
+    // 根据时间戳匹配数据
+    // ...
+}
+\end{lstlisting}
+
+\subsection{误差权重}
+
+由于位置和姿态的误差量级不同，需要设置权重：
+
+\begin{equation}
+\boldsymbol{\epsilon}_w = \mathbf{W} \boldsymbol{\epsilon}
+\end{equation}
+
+其中 $\mathbf{W}$ 是权重矩阵：
+
+\begin{equation}
+\mathbf{W} = \begin{bmatrix}
+    w_r \mathbf{I}_3 & \mathbf{0} \\
+    \mathbf{0} & w_p \mathbf{I}_3
+\end{bmatrix}
+\end{equation}
+
+通常 $w_r \approx 1$（姿态），$w_p \approx 100-1000$（位置，单位：m$^{-1}$）。
+
+\section{完整辨识流程示例}
+
+\begin{algorithm}
+\caption{运动学参数辨识完整流程}
+\begin{algorithmic}[1]
+\REQUIRE URDF模型文件、外部测量设备、数据采集系统
+\ENSURE 辨识的运动学参数
+\STATE 加载URDF模型，初始化Pinocchio
+\STATE 设计标定轨迹（覆盖工作空间）
+\STATE \textbf{for} 每个标定点 \textbf{do}
+    \STATE 控制机器人移动到目标位置
+    \STATE 读取关节角度 q
+    \STATE 使用外部设备测量末端执行器位姿
+    \STATE 保存数据点 (q, pos\_measured, quat\_measured)
+\STATE \textbf{end for}
+\STATE 初始化运动学参数（使用URDF中的值）
+\STATE \textbf{repeat}
+    \STATE 对每个数据点计算预测位姿和误差
+    \STATE 计算运动学回归矩阵
+    \STATE 求解参数更新：$\delta \theta = (J^T J)^{-1} J^T \epsilon$
+    \STATE 更新参数：$\theta = \theta + \delta \theta$
+    \STATE 更新模型参数
+\STATE \textbf{until} 收敛或达到最大迭代次数
+\STATE 使用验证数据评估辨识精度
+\STATE \textbf{if} 精度不满足要求 \textbf{then}
+    \STATE 增加标定点，重新采集数据
+\STATE \textbf{end if}
+\STATE 更新URDF模型中的参数
+\end{algorithmic}
+\end{algorithm}
+
+\section{与动力学辨识的联合}
+
+\subsection{联合辨识}
+
+运动学和动力学参数可以联合辨识：
+
+\begin{enumerate}
+    \item \textbf{先进行运动学辨识：} 使用外部测量设备辨识几何参数
+    \item \textbf{再进行动力学辨识：} 使用辨识后的运动学参数，辨识动力学参数
+    \item \textbf{迭代优化：} 可以交替优化运动学和动力学参数
+\end{enumerate}
+
+\subsection{优势}
+
+\begin{itemize}
+    \item 运动学参数准确后，动力学辨识更准确
+    \item 可以同时优化所有参数
+    \item 提高整体模型精度
+\end{itemize}
+
+\section{总结}
+
+\begin{itemize}
+    \item \textbf{Pinocchio 支持运动学辨识：} 提供了回归矩阵计算、正向运动学等关键功能
+    \item \textbf{需要外部测量：} 运动学辨识通常需要外部测量设备（视觉、激光追踪器等）
+    \item \textbf{非线性优化：} 由于运动学方程非线性，需要迭代优化
+    \item \textbf{适用于复杂系统：} 单臂、双臂、全身系统都可以使用相同的方法
+    \item \textbf{与SDK集成：} xCore SDK 提供了TCP和基坐标系标定功能
+    \item \textbf{联合辨识：} 可以与动力学辨识联合进行，提高整体精度
+\end{itemize}
+
+\section{参考文献}
+
+\begin{enumerate}
+    \item Pinocchio Documentation: \url{https://stack-of-tasks.github.io/pinocchio/}
+    \item Hollerbach, J. M., and Wampler, C. W. (1996). "The calibration index and taxonomy for robot kinematic calibration methods." \textit{The International Journal of Robotics Research}, 15(6), 573-591.
+    \item Chen, I. M., and Yang, G. (1999). "Kinematic calibration of modular reconfigurable robots using product-of-exponentials formula." \textit{Journal of Robotic Systems}, 16(11), 587-597.
+    \item Hayati, S., and Mirmirani, M. (1985). "Improving the absolute positioning accuracy of robot manipulators." \textit{Journal of Robotic Systems}, 2(4), 397-413.
+    \item \texttt{hybrid\_force\_position\_control.cpp} - ROKAE xCore SDK 示例代码
+    \item xCore SDK 文档：坐标系标定功能
+\end{enumerate}
+
+\end{document}
+

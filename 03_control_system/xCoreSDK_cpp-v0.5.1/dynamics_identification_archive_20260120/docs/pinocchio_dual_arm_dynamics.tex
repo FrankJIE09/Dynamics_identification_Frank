@@ -1,0 +1,808 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{float}
+
+\geometry{margin=2.5cm}
+
+\title{Pinocchio 动力学计算详解：单臂、双臂与全身系统}
+\author{基于 hybrid\_force\_position\_control.cpp}
+\date{\today}
+
+\lstset{
+    language=C++,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{green!60!black},
+    stringstyle=\color{red},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    stepnumber=1,
+    numbersep=5pt,
+    frame=single,
+    breaklines=true,
+    showspaces=false,
+    showstringspaces=false,
+    tabsize=2
+}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+\newpage
+
+\section{概述}
+
+本文档基于 \texttt{hybrid\_force\_position\_control.cpp} 中的实现，详细介绍 Pinocchio 库如何计算机器人动力学，并对比单臂系统和双臂系统的计算方法。
+
+\section{Pinocchio 动力学计算基础}
+
+\subsection{机器人动力学方程}
+
+对于 $n$ 自由度的机器人，其动力学方程可以表示为：
+
+\begin{equation}
+\boldsymbol{\tau} = \mathbf{M}(\boldsymbol{q})\ddot{\boldsymbol{q}} + \mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}})\dot{\boldsymbol{q}} + \boldsymbol{g}(\boldsymbol{q}) + \boldsymbol{\tau}_f
+\end{equation}
+
+其中：
+\begin{itemize}
+    \item $\boldsymbol{\tau} \in \mathbb{R}^n$：关节力矩向量
+    \item $\mathbf{M}(\boldsymbol{q}) \in \mathbb{R}^{n \times n}$：质量矩阵（惯性矩阵）
+    \item $\mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}}) \in \mathbb{R}^{n \times n}$：科氏力矩阵
+    \item $\boldsymbol{g}(\boldsymbol{q}) \in \mathbb{R}^n$：重力项
+    \item $\boldsymbol{\tau}_f$：摩擦力项
+    \item $\boldsymbol{q}, \dot{\boldsymbol{q}}, \ddot{\boldsymbol{q}} \in \mathbb{R}^n$：关节位置、速度、加速度
+\end{itemize}
+
+\subsection{Pinocchio 的核心函数}
+
+Pinocchio 使用 \texttt{computeAllTerms()} 函数一次性计算所有动力学项：
+
+\begin{lstlisting}[caption=Pinocchio 动力学计算]
+// 计算所有动力学项
+pinocchio::computeAllTerms(pinocchio_model, pinocchio_data, q_pin, dq_pin);
+
+// 获取各项
+gravity_pin = pinocchio_data.g;        // 重力项 g(q)
+coriolis_pin = pinocchio_data.C;       // 科氏力矩阵 C(q, dq)
+mass_pin = pinocchio_data.M;           // 质量矩阵 M(q)
+coriolis_torque_pin = coriolis_pin * dq_pin;  // 科氏力扭矩 C(q, dq) * dq
+inertia_torque_pin = mass_pin * ddq_pin;      // 惯性力扭矩 M(q) * ddq
+\end{lstlisting}
+
+\section{单臂系统动力学计算}
+
+\subsection{模型初始化}
+
+在 \texttt{hybrid\_force\_position\_control.cpp} 中，单臂系统（7自由度）的初始化过程如下：
+
+\subsubsection{1. 加载 URDF 模型}
+
+\begin{lstlisting}[caption=加载 URDF 模型]
+// URDF 文件路径
+std::string urdf_file_path = URDF_FILE_PATH;  // 编译时定义
+
+// 创建模型和数据对象
+pinocchio::Model pinocchio_model;
+pinocchio::Data pinocchio_data(pinocchio_model);
+
+// 从 URDF 构建模型
+pinocchio::urdf::buildModel(urdf_file_path, pinocchio_model);
+\end{lstlisting}
+
+\textbf{关键点：}
+\begin{itemize}
+    \item URDF 文件定义了机器人的树形结构（从基座到末端执行器）
+    \item \texttt{buildModel()} 解析 URDF，构建内部表示
+    \item 对于单臂系统，\texttt{pinocchio\_model.nq = 7}（7个关节）
+\end{itemize}
+
+\subsubsection{2. 设置重力方向}
+
+\begin{lstlisting}[caption=设置重力方向]
+// 考虑安装位置：外旋 XYZ = 0 90 -90
+Eigen::Matrix3d R_y = Eigen::AngleAxisd(M_PI/2, Eigen::Vector3d::UnitY()).toRotationMatrix();
+Eigen::Matrix3d R_z = Eigen::AngleAxisd(-M_PI/2, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+Eigen::Matrix3d R_base_to_world = R_z * R_y;
+Eigen::Vector3d gravity_world(0, 0, -9.81);
+Eigen::Vector3d gravity_base = R_base_to_world.transpose() * gravity_world;
+
+pinocchio_model.gravity.linear() = gravity_base;
+\end{lstlisting}
+
+\textbf{说明：}
+\begin{itemize}
+    \item 重力方向必须根据机器人的安装位置进行坐标变换
+    \item 世界坐标系中的重力为 $(0, 0, -9.81)$ m/s²
+    \item 需要转换到机器人基座坐标系
+\end{itemize}
+
+\subsubsection{3. 添加负载}
+
+\begin{lstlisting}[caption=添加末端执行器负载]
+// 创建负载惯性
+Eigen::Vector3d load_com(load_centre[0], load_centre[1], load_centre[2]);
+Eigen::Matrix3d inertia_matrix = Eigen::Matrix3d::Zero();
+inertia_matrix(0, 0) = load_inertia[0];  // Ixx
+inertia_matrix(1, 1) = load_inertia[1];  // Iyy
+inertia_matrix(2, 2) = load_inertia[2];  // Izz
+pinocchio::Inertia load_inertia_pin(load_mass, load_com, inertia_matrix);
+
+// 将负载添加到末端执行器 joint 的惯性
+pinocchio_model.inertias[ee_joint_id] += load_inertia_pin;
+\end{lstlisting}
+
+\subsection{实时控制循环中的计算}
+
+在控制循环（1ms 周期）中，每次迭代都进行动力学计算：
+
+\begin{lstlisting}[caption=实时动力学计算]
+// 1. 获取当前关节状态（7维）
+std::array<double, 7> q{}, dq_m{}, ddq_c{};
+robot.getStateData(jointPos_m, q);      // 关节位置
+robot.getStateData(jointVel_m, dq_m);   // 关节速度
+robot.getStateData(jointAcc_c, ddq_c);  // 关节加速度
+
+// 2. 转换为 Eigen 向量
+Eigen::VectorXd q_pin(7), dq_pin(7), ddq_pin(7);
+for (int i = 0; i < 7; i++) {
+    q_pin(i) = q[i];
+    dq_pin(i) = dq_m[i];
+    ddq_pin(i) = ddq_c[i];
+}
+
+// 3. 计算所有动力学项
+pinocchio::computeAllTerms(pinocchio_model, pinocchio_data, q_pin, dq_pin);
+
+// 4. 提取各项
+gravity_pin = pinocchio_data.g;                    // 7维重力项
+coriolis_pin = pinocchio_data.C;                   // 7x7 科氏力矩阵
+mass_pin = pinocchio_data.M;                       // 7x7 质量矩阵
+coriolis_torque_pin = coriolis_pin * dq_pin;      // 7维科氏力扭矩
+inertia_torque_pin = mass_pin * ddq_pin;           // 7维惯性力扭矩
+\end{lstlisting}
+
+\subsection{单臂系统的数学表示}
+
+对于单臂系统（$n=7$）：
+
+\begin{align}
+\boldsymbol{q} &\in \mathbb{R}^7 \\
+\mathbf{M}(\boldsymbol{q}) &\in \mathbb{R}^{7 \times 7} \\
+\mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}}) &\in \mathbb{R}^{7 \times 7} \\
+\boldsymbol{g}(\boldsymbol{q}) &\in \mathbb{R}^7
+\end{align}
+
+总动力学扭矩为：
+
+\begin{equation}
+\boldsymbol{\tau}_{\text{full}} = \mathbf{M}(\boldsymbol{q})\ddot{\boldsymbol{q}} + \mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}})\dot{\boldsymbol{q}} + \boldsymbol{g}(\boldsymbol{q})
+\end{equation}
+
+\section{双臂系统动力学计算}
+
+\subsection{双臂系统的特点}
+
+双臂系统与单臂系统的主要区别：
+
+\begin{enumerate}
+    \item \textbf{自由度增加：} 如果每条臂有 7 个关节，双臂系统共有 14 个关节
+    \item \textbf{树形结构：} 从基座分支出两条独立的运动链
+    \item \textbf{耦合效应：} 两个手臂通过基座耦合，质量矩阵包含交叉项
+\end{enumerate}
+
+\subsection{URDF 结构}
+
+双臂系统的 URDF 通常具有以下结构：
+
+\begin{lstlisting}[language=XML, caption=双臂 URDF 结构示例]
+<robot name="dual_arm_robot">
+    <link name="base_link"/>
+    
+    <!-- 左臂 -->
+    <joint name="left_joint_1" type="revolute">
+        <parent link="base_link"/>
+        <child link="left_link_1"/>
+    </joint>
+    <!-- ... 左臂的其他关节 ... -->
+    <link name="left_end_effector"/>
+    
+    <!-- 右臂 -->
+    <joint name="right_joint_1" type="revolute">
+        <parent link="base_link"/>
+        <child link="right_link_1"/>
+    </joint>
+    <!-- ... 右臂的其他关节 ... -->
+    <link name="right_end_effector"/>
+</robot>
+\end{lstlisting}
+
+\subsection{模型初始化（双臂）}
+
+双臂系统的初始化过程与单臂类似，但需要注意：
+
+\begin{lstlisting}[caption=双臂系统初始化]
+// 1. 加载双臂 URDF（与单臂相同）
+pinocchio::urdf::buildModel(urdf_file_path, pinocchio_model);
+// 此时 pinocchio_model.nq = 14（假设每条臂7个关节）
+
+// 2. 设置重力方向（与单臂相同）
+pinocchio_model.gravity.linear() = gravity_base;
+
+// 3. 添加负载（需要分别为两个末端执行器添加）
+// 左臂末端执行器
+pinocchio::FrameIndex left_ee_id = pinocchio_model.getFrameId("left_end_effector");
+pinocchio::JointIndex left_ee_joint = pinocchio_model.frames[left_ee_id].parent;
+pinocchio_model.inertias[left_ee_joint] += left_load_inertia;
+
+// 右臂末端执行器
+pinocchio::FrameIndex right_ee_id = pinocchio_model.getFrameId("right_end_effector");
+pinocchio::JointIndex right_ee_joint = pinocchio_model.frames[right_ee_id].parent;
+pinocchio_model.inertias[right_ee_joint] += right_load_inertia;
+\end{lstlisting}
+
+\subsection{实时控制循环中的计算（双臂）}
+
+双臂系统的动力学计算需要处理 14 维向量：
+
+\begin{lstlisting}[caption=双臂系统实时动力学计算]
+// 1. 获取关节状态（14维）
+std::array<double, 14> q{}, dq_m{}, ddq_c{};
+// 假设前7个是左臂，后7个是右臂
+// q[0-6]: 左臂关节
+// q[7-13]: 右臂关节
+
+// 2. 转换为 Eigen 向量
+Eigen::VectorXd q_pin(14), dq_pin(14), ddq_pin(14);
+for (int i = 0; i < 14; i++) {
+    q_pin(i) = q[i];
+    dq_pin(i) = dq_m[i];
+    ddq_pin(i) = ddq_c[i];
+}
+
+// 3. 计算所有动力学项（与单臂相同）
+pinocchio::computeAllTerms(pinocchio_model, pinocchio_data, q_pin, dq_pin);
+
+// 4. 提取各项（维度变为14）
+gravity_pin = pinocchio_data.g;                    // 14维重力项
+coriolis_pin = pinocchio_data.C;                   // 14x14 科氏力矩阵
+mass_pin = pinocchio_data.M;                       // 14x14 质量矩阵
+coriolis_torque_pin = coriolis_pin * dq_pin;      // 14维科氏力扭矩
+inertia_torque_pin = mass_pin * ddq_pin;           // 14维惯性力扭矩
+\end{lstlisting}
+
+\subsection{双臂系统的数学表示}
+
+对于双臂系统（每条臂 $n=7$，总共 $N=14$）：
+
+\begin{align}
+\boldsymbol{q} &= \begin{bmatrix} \boldsymbol{q}_L \\ \boldsymbol{q}_R \end{bmatrix} \in \mathbb{R}^{14} \\
+\mathbf{M}(\boldsymbol{q}) &= \begin{bmatrix} 
+    \mathbf{M}_{LL} & \mathbf{M}_{LR} \\
+    \mathbf{M}_{RL} & \mathbf{M}_{RR}
+\end{bmatrix} \in \mathbb{R}^{14 \times 14} \\
+\mathbf{C}(\boldsymbol{q}, \dot{\boldsymbol{q}}) &\in \mathbb{R}^{14 \times 14} \\
+\boldsymbol{g}(\boldsymbol{q}) &= \begin{bmatrix} \boldsymbol{g}_L \\ \boldsymbol{g}_R \end{bmatrix} \in \mathbb{R}^{14}
+\end{align}
+
+其中：
+\begin{itemize}
+    \item $\boldsymbol{q}_L, \boldsymbol{q}_R \in \mathbb{R}^7$：左臂和右臂的关节角度
+    \item $\mathbf{M}_{LL}, \mathbf{M}_{RR} \in \mathbb{R}^{7 \times 7}$：左臂和右臂的自惯性矩阵
+    \item $\mathbf{M}_{LR}, \mathbf{M}_{RL} \in \mathbb{R}^{7 \times 7}$：双臂之间的耦合惯性矩阵
+\end{itemize}
+
+\subsection{双臂系统的耦合效应}
+
+双臂系统的质量矩阵包含耦合项，反映了两个手臂之间的动力学耦合：
+
+\begin{equation}
+\mathbf{M}(\boldsymbol{q}) = \begin{bmatrix} 
+    \mathbf{M}_{LL}(\boldsymbol{q}) & \mathbf{M}_{LR}(\boldsymbol{q}) \\
+    \mathbf{M}_{RL}(\boldsymbol{q}) & \mathbf{M}_{RR}(\boldsymbol{q})
+\end{bmatrix}
+\end{equation}
+
+\textbf{物理意义：}
+\begin{itemize}
+    \item $\mathbf{M}_{LL}$：左臂运动时，左臂自身的惯性
+    \item $\mathbf{M}_{RR}$：右臂运动时，右臂自身的惯性
+    \item $\mathbf{M}_{LR}$：右臂运动对左臂的惯性影响（通过基座耦合）
+    \item $\mathbf{M}_{RL}$：左臂运动对右臂的惯性影响（通过基座耦合）
+\end{itemize}
+
+\section{代码实现对比}
+
+\subsection{单臂系统代码结构}
+
+\begin{lstlisting}[caption=单臂系统关键代码]
+// 模型维度
+const int n_dof = 7;
+
+// 状态向量
+std::array<double, n_dof> q{}, dq_m{}, ddq_c{};
+
+// Pinocchio 计算
+pinocchio::computeAllTerms(pinocchio_model, pinocchio_data, q_pin, dq_pin);
+
+// 结果维度
+// gravity_pin: 7维
+// mass_pin: 7x7
+// coriolis_pin: 7x7
+\end{lstlisting}
+
+\subsection{双臂系统代码结构}
+
+\begin{lstlisting}[caption=双臂系统关键代码]
+// 模型维度
+const int n_dof_per_arm = 7;
+const int n_dof_total = 14;
+
+// 状态向量（需要拼接两个手臂的状态）
+std::array<double, n_dof_total> q{}, dq_m{}, ddq_c{};
+// q[0-6]: 左臂关节
+// q[7-13]: 右臂关节
+
+// Pinocchio 计算（与单臂完全相同）
+pinocchio::computeAllTerms(pinocchio_model, pinocchio_data, q_pin, dq_pin);
+
+// 结果维度（自动变为14维）
+// gravity_pin: 14维
+// mass_pin: 14x14
+// coriolis_pin: 14x14
+\end{lstlisting}
+
+\section{雅可比矩阵计算}
+
+\subsection{单臂系统雅可比}
+
+单臂系统只需要计算一个末端执行器的雅可比矩阵：
+
+\begin{lstlisting}[caption=单臂雅可比计算]
+// 获取末端执行器索引
+pinocchio::FrameIndex ee_id = pinocchio_model.getFrameId("end_effector");
+
+// 计算雅可比矩阵（6x7）
+Eigen::MatrixXd J = pinocchio::computeFrameJacobian(
+    pinocchio_model, pinocchio_data, q_pin, ee_id, 
+    pinocchio::LOCAL_WORLD_ALIGNED);
+// J: 6x7 矩阵（6维任务空间，7维关节空间）
+\end{lstlisting}
+
+\subsection{双臂系统雅可比}
+
+双臂系统需要分别计算两个末端执行器的雅可比矩阵：
+
+\begin{lstlisting}[caption=双臂雅可比计算]
+// 获取两个末端执行器索引
+pinocchio::FrameIndex left_ee_id = pinocchio_model.getFrameId("left_end_effector");
+pinocchio::FrameIndex right_ee_id = pinocchio_model.getFrameId("right_end_effector");
+
+// 计算左臂雅可比（6x14，但只有前7列非零）
+Eigen::MatrixXd J_left = pinocchio::computeFrameJacobian(
+    pinocchio_model, pinocchio_data, q_pin, left_ee_id, 
+    pinocchio::LOCAL_WORLD_ALIGNED);
+// J_left: 6x14 矩阵
+
+// 计算右臂雅可比（6x14，但只有后7列非零）
+Eigen::MatrixXd J_right = pinocchio::computeFrameJacobian(
+    pinocchio_model, pinocchio_data, q_pin, right_ee_id, 
+    pinocchio::LOCAL_WORLD_ALIGNED);
+// J_right: 6x14 矩阵
+
+// 组合雅可比（用于双臂协同控制）
+Eigen::MatrixXd J_combined(12, 14);
+J_combined << J_left, J_right;  // 12x14 矩阵
+\end{lstlisting}
+
+\section{任务空间质量矩阵}
+
+\subsection{单臂系统任务空间质量矩阵}
+
+对于单臂系统，任务空间质量矩阵为：
+
+\begin{equation}
+\boldsymbol{\Lambda}_s = (\mathbf{J}_s \mathbf{M}^{-1} \mathbf{J}_s^T)^{-1} \in \mathbb{R}^{6 \times 6}
+\end{equation}
+
+其中 $\mathbf{J}_s \in \mathbb{R}^{6 \times 7}$ 是任务空间雅可比矩阵。
+
+\subsection{双臂系统任务空间质量矩阵}
+
+对于双臂系统，有两种处理方式：
+
+\subsubsection{方式1：分别计算每个手臂的任务空间质量矩阵}
+
+\begin{align}
+\boldsymbol{\Lambda}_{L} &= (\mathbf{J}_L \mathbf{M}^{-1} \mathbf{J}_L^T)^{-1} \in \mathbb{R}^{6 \times 6} \\
+\boldsymbol{\Lambda}_{R} &= (\mathbf{J}_R \mathbf{M}^{-1} \mathbf{J}_R^T)^{-1} \in \mathbb{R}^{6 \times 6}
+\end{align}
+
+\subsubsection{方式2：计算组合任务空间质量矩阵}
+
+如果定义组合任务空间（12维：左臂6维 + 右臂6维）：
+
+\begin{equation}
+\boldsymbol{\Lambda}_{\text{combined}} = (\mathbf{J}_{\text{combined}} \mathbf{M}^{-1} \mathbf{J}_{\text{combined}}^T)^{-1} \in \mathbb{R}^{12 \times 12}
+\end{equation}
+
+其中 $\mathbf{J}_{\text{combined}} = \begin{bmatrix} \mathbf{J}_L \\ \mathbf{J}_R \end{bmatrix} \in \mathbb{R}^{12 \times 14}$。
+
+\section{计算复杂度分析}
+
+\subsection{单臂系统}
+
+\begin{itemize}
+    \item \textbf{质量矩阵计算：} $O(n^2)$，其中 $n=7$，约为 $O(49)$
+    \item \textbf{科氏力矩阵计算：} $O(n^2)$
+    \item \textbf{重力项计算：} $O(n)$
+    \item \textbf{总复杂度：} $O(n^2)$
+\end{itemize}
+
+\subsection{双臂系统}
+
+\begin{itemize}
+    \item \textbf{质量矩阵计算：} $O(N^2)$，其中 $N=14$，约为 $O(196)$
+    \item \textbf{科氏力矩阵计算：} $O(N^2)$
+    \item \textbf{重力项计算：} $O(N)$
+    \item \textbf{总复杂度：} $O(N^2)$
+\end{itemize}
+
+\textbf{注意：} 双臂系统的计算复杂度是单臂的 4 倍（$14^2 / 7^2 = 4$），但 Pinocchio 使用高效的递归算法（RNEA），实际计算时间可能小于 4 倍。
+
+\section{实际应用建议}
+
+\subsection{单臂系统}
+
+\begin{enumerate}
+    \item 直接使用 \texttt{computeAllTerms()} 计算所有动力学项
+    \item 计算单个末端执行器的雅可比矩阵
+    \item 使用标准的混合力位控制算法
+\end{enumerate}
+
+\subsection{双臂系统}
+
+\begin{enumerate}
+    \item \textbf{状态向量组织：} 确保关节状态按照 URDF 中定义的顺序排列
+    \item \textbf{分别处理：} 可以分别计算每个手臂的雅可比和任务空间质量矩阵
+    \item \textbf{耦合考虑：} 如果需要精确控制，需要考虑质量矩阵中的耦合项
+    \item \textbf{协同控制：} 可以使用组合雅可比矩阵实现双臂协同控制
+\end{enumerate}
+
+\section{全身系统动力学计算}
+
+\subsection{全身系统的结构}
+
+全身系统通常包括以下部分：
+
+\begin{enumerate}
+    \item \textbf{底盘（Base）：} 移动平台，可能包含轮式或足式移动机构
+    \item \textbf{腰部（Torso）：} 连接底盘和上身的中间部分
+        \begin{itemize}
+            \item \textbf{折叠关节（Pitch）：} 前后俯仰运动
+            \item \textbf{旋转关节（Yaw）：} 左右旋转运动
+            \item 可能还有侧倾关节（Roll）
+        \end{itemize}
+    \item \textbf{双臂：} 左臂和右臂，每条臂通常有 7 个关节
+    \item \textbf{头部（可选）：} 可能包含视觉传感器
+\end{enumerate}
+
+\subsection{URDF 结构示例}
+
+全身系统的 URDF 结构如下：
+
+\begin{lstlisting}[language=XML, caption=全身系统 URDF 结构]
+<robot name="full_body_robot">
+    <!-- 世界坐标系 -->
+    <link name="world"/>
+    
+    <!-- 底盘 -->
+    <link name="base_link">
+        <inertial>
+            <mass value="50.0"/>  <!-- 底盘质量 -->
+            <inertia ixx="10.0" iyy="10.0" izz="5.0"/>
+        </inertial>
+    </link>
+    
+    <!-- 底盘到世界的连接（固定或浮动） -->
+    <joint name="base_joint" type="floating">
+        <parent link="world"/>
+        <child link="base_link"/>
+    </joint>
+    
+    <!-- 腰部折叠关节（Pitch） -->
+    <joint name="torso_pitch_joint" type="revolute">
+        <parent link="base_link"/>
+        <child link="torso_link"/>
+        <axis xyz="0 1 0"/>  <!-- Y轴旋转，前后俯仰 -->
+        <limit lower="-1.57" upper="1.57"/>  <!-- ±90度 -->
+    </joint>
+    
+    <link name="torso_link">
+        <inertial>
+            <mass value="20.0"/>  <!-- 腰部质量 -->
+            <inertia ixx="2.0" iyy="2.0" izz="1.0"/>
+        </inertial>
+    </link>
+    
+    <!-- 腰部旋转关节（Yaw） -->
+    <joint name="torso_yaw_joint" type="revolute">
+        <parent link="torso_link"/>
+        <child link="torso_upper_link"/>
+        <axis xyz="0 0 1"/>  <!-- Z轴旋转，左右旋转 -->
+        <limit lower="-3.14" upper="3.14"/>  <!-- ±180度 -->
+    </joint>
+    
+    <link name="torso_upper_link">
+        <inertial>
+            <mass value="15.0"/>
+            <inertia ixx="1.5" iyy="1.5" izz="0.8"/>
+        </inertial>
+    </link>
+    
+    <!-- 左臂（从腰部上端连接） -->
+    <joint name="left_shoulder_joint" type="revolute">
+        <parent link="torso_upper_link"/>
+        <child link="left_arm_link1"/>
+    </joint>
+    <!-- ... 左臂的其他关节 ... -->
+    
+    <!-- 右臂（从腰部上端连接） -->
+    <joint name="right_shoulder_joint" type="revolute">
+        <parent link="torso_upper_link"/>
+        <child link="right_arm_link1"/>
+    </joint>
+    <!-- ... 右臂的其他关节 ... -->
+</robot>
+\end{lstlisting}
+
+\subsection{全身系统的自由度}
+
+假设系统配置如下：
+\begin{itemize}
+    \item 底盘：6 自由度（3 个位置 + 3 个姿态，如果是浮动基座）
+    \item 腰部折叠关节：1 自由度（Pitch）
+    \item 腰部旋转关节：1 自由度（Yaw）
+    \item 左臂：7 自由度
+    \item 右臂：7 自由度
+    \item \textbf{总自由度：} $N = 6 + 1 + 1 + 7 + 7 = 22$ 自由度
+\end{itemize}
+
+\textbf{注意：} 如果底盘是固定的（非浮动），则底盘自由度为 0，总自由度为 $N = 1 + 1 + 7 + 7 = 16$。
+
+\subsection{模型初始化（全身系统）}
+
+\begin{lstlisting}[caption=全身系统初始化]
+// 1. 加载全身 URDF
+pinocchio::urdf::buildModel(urdf_file_path, pinocchio_model);
+// 此时 pinocchio_model.nq = 22（假设浮动基座）
+
+// 2. 设置重力方向
+pinocchio_model.gravity.linear() = Eigen::Vector3d(0, 0, -9.81);
+
+// 3. 获取关键关节索引
+// 腰部折叠关节
+int torso_pitch_id = pinocchio_model.getJointId("torso_pitch_joint");
+// 腰部旋转关节
+int torso_yaw_id = pinocchio_model.getJointId("torso_yaw_joint");
+// 左臂肩关节
+int left_shoulder_id = pinocchio_model.getJointId("left_shoulder_joint");
+// 右臂肩关节
+int right_shoulder_id = pinocchio_model.getJointId("right_shoulder_joint");
+
+// 4. 添加负载（分别为两个末端执行器）
+pinocchio::FrameIndex left_ee_id = pinocchio_model.getFrameId("left_end_effector");
+pinocchio::FrameIndex right_ee_id = pinocchio_model.getFrameId("right_end_effector");
+// ... 添加负载惯性 ...
+\end{lstlisting}
+
+\subsection{实时控制循环中的计算（全身系统）}
+
+全身系统的状态向量组织方式：
+
+\begin{lstlisting}[caption=全身系统状态向量组织]
+// 状态向量维度：22（假设浮动基座）
+std::array<double, 22> q{}, dq_m{}, ddq_c{};
+
+// 向量组织方式（按 URDF 中定义的顺序）：
+// q[0-5]:   底盘位置和姿态（如果是浮动基座）
+//           [x, y, z, roll, pitch, yaw]
+// q[6]:     腰部折叠关节（Pitch）
+// q[7]:     腰部旋转关节（Yaw）
+// q[8-14]:  左臂关节（7个）
+// q[15-21]: 右臂关节（7个）
+
+// 转换为 Eigen 向量
+Eigen::VectorXd q_pin(22), dq_pin(22), ddq_pin(22);
+for (int i = 0; i < 22; i++) {
+    q_pin(i) = q[i];
+    dq_pin(i) = dq_m[i];
+    ddq_pin(i) = ddq_c[i];
+}
+
+// 计算所有动力学项（与单臂/双臂完全相同）
+pinocchio::computeAllTerms(pinocchio_model, pinocchio_data, q_pin, dq_pin);
+
+// 提取各项（维度变为22）
+gravity_pin = pinocchio_data.g;                    // 22维重力项
+coriolis_pin = pinocchio_data.C;                   // 22x22 科氏力矩阵
+mass_pin = pinocchio_data.M;                       // 22x22 质量矩阵
+coriolis_torque_pin = coriolis_pin * dq_pin;      // 22维科氏力扭矩
+inertia_torque_pin = mass_pin * ddq_pin;           // 22维惯性力扭矩
+\end{lstlisting}
+
+\subsection{全身系统的数学表示}
+
+对于全身系统，质量矩阵具有分块结构：
+
+\begin{equation}
+\mathbf{M}(\boldsymbol{q}) = \begin{bmatrix}
+    \mathbf{M}_{BB} & \mathbf{M}_{BT} & \mathbf{M}_{BL} & \mathbf{M}_{BR} \\
+    \mathbf{M}_{TB} & \mathbf{M}_{TT} & \mathbf{M}_{TL} & \mathbf{M}_{TR} \\
+    \mathbf{M}_{LB} & \mathbf{M}_{LT} & \mathbf{M}_{LL} & \mathbf{M}_{LR} \\
+    \mathbf{M}_{RB} & \mathbf{M}_{RT} & \mathbf{M}_{RL} & \mathbf{M}_{RR}
+\end{bmatrix} \in \mathbb{R}^{22 \times 22}
+\end{equation}
+
+其中：
+\begin{itemize}
+    \item $\mathbf{M}_{BB} \in \mathbb{R}^{6 \times 6}$：底盘的惯性矩阵
+    \item $\mathbf{M}_{TT} \in \mathbb{R}^{2 \times 2}$：腰部的惯性矩阵（折叠+旋转）
+    \item $\mathbf{M}_{LL}, \mathbf{M}_{RR} \in \mathbb{R}^{7 \times 7}$：左臂和右臂的自惯性矩阵
+    \item 其他块表示不同部分之间的耦合惯性
+\end{itemize}
+
+\subsection{腰部关节的特殊性}
+
+\subsubsection{折叠关节（Pitch）的影响}
+
+腰部折叠关节的运动会影响：
+\begin{enumerate}
+    \item \textbf{重力补偿：} 改变整个上身（包括双臂）的重心位置
+    \item \textbf{惯性耦合：} 当腰部折叠时，双臂的惯性会发生变化
+    \item \textbf{科氏力：} 腰部折叠速度会影响双臂的科氏力项
+\end{enumerate}
+
+数学表示：
+
+\begin{equation}
+\boldsymbol{g}(\boldsymbol{q}) = \begin{bmatrix}
+    \boldsymbol{g}_B \\
+    \boldsymbol{g}_T(\boldsymbol{q}_T, \boldsymbol{q}_L, \boldsymbol{q}_R) \\
+    \boldsymbol{g}_L(\boldsymbol{q}_T, \boldsymbol{q}_L) \\
+    \boldsymbol{g}_R(\boldsymbol{q}_T, \boldsymbol{q}_R)
+\end{bmatrix}
+\end{equation}
+
+其中 $\boldsymbol{g}_T, \boldsymbol{g}_L, \boldsymbol{g}_R$ 都依赖于腰部折叠角度 $\boldsymbol{q}_T$。
+
+\subsubsection{旋转关节（Yaw）的影响}
+
+腰部旋转关节主要影响：
+\begin{enumerate}
+    \item \textbf{坐标系变换：} 改变双臂相对于世界坐标系的方向
+    \item \textbf{科氏力耦合：} 旋转速度会产生额外的科氏力项
+    \item \textbf{任务空间映射：} 影响末端执行器在世界坐标系中的位置
+\end{enumerate}
+
+\subsection{雅可比矩阵计算（全身系统）}
+
+对于全身系统，需要分别计算各个末端执行器的雅可比矩阵：
+
+\begin{lstlisting}[caption=全身系统雅可比计算]
+// 计算左臂末端执行器雅可比（6x22）
+pinocchio::FrameIndex left_ee_id = pinocchio_model.getFrameId("left_end_effector");
+Eigen::MatrixXd J_left = pinocchio::computeFrameJacobian(
+    pinocchio_model, pinocchio_data, q_pin, left_ee_id, 
+    pinocchio::LOCAL_WORLD_ALIGNED);
+// J_left 的列对应：底盘(6) + 腰部(2) + 左臂(7) + 右臂(7)
+// 但只有前 6+2+7=15 列非零
+
+// 计算右臂末端执行器雅可比（6x22）
+pinocchio::FrameIndex right_ee_id = pinocchio_model.getFrameId("right_end_effector");
+Eigen::MatrixXd J_right = pinocchio::computeFrameJacobian(
+    pinocchio_model, pinocchio_data, q_pin, right_ee_id, 
+    pinocchio::LOCAL_WORLD_ALIGNED);
+// J_right 的列对应：底盘(6) + 腰部(2) + 左臂(7) + 右臂(7)
+// 但只有前 6+2+7=15 列和后 7 列非零
+
+// 计算腰部中心点雅可比（可选，用于腰部控制）
+pinocchio::FrameIndex torso_id = pinocchio_model.getFrameId("torso_upper_link");
+Eigen::MatrixXd J_torso = pinocchio::computeFrameJacobian(
+    pinocchio_model, pinocchio_data, q_pin, torso_id, 
+    pinocchio::LOCAL_WORLD_ALIGNED);
+\end{lstlisting}
+
+\subsection{任务空间质量矩阵（全身系统）}
+
+对于全身系统，任务空间质量矩阵的计算需要考虑所有耦合：
+
+\begin{equation}
+\boldsymbol{\Lambda}_L = (\mathbf{J}_L \mathbf{M}^{-1} \mathbf{J}_L^T)^{-1} \in \mathbb{R}^{6 \times 6}
+\end{equation}
+
+其中 $\mathbf{J}_L \in \mathbb{R}^{6 \times 22}$ 是左臂的雅可比矩阵。
+
+\textbf{关键点：} 由于 $\mathbf{J}_L$ 包含了底盘、腰部和左臂的列，任务空间质量矩阵会自动考虑这些部分的耦合效应。
+
+\subsection{控制策略考虑}
+
+\subsubsection{分层控制}
+
+对于全身系统，可以采用分层控制策略：
+
+\begin{enumerate}
+    \item \textbf{底层：} 控制底盘和腰部，维持整体平衡
+    \item \textbf{中层：} 控制腰部姿态，优化双臂工作空间
+    \item \textbf{顶层：} 控制双臂末端执行器，执行具体任务
+\end{enumerate}
+
+\subsubsection{优先级控制}
+
+可以使用零空间投影实现优先级控制：
+
+\begin{lstlisting}[caption=优先级控制示例]
+// 主要任务：控制左臂末端位置
+Eigen::VectorXd F_primary = computeLeftArmForce();
+
+// 次要任务：控制腰部姿态（在左臂任务的零空间中）
+Eigen::MatrixXd J_left = computeLeftArmJacobian();
+Eigen::MatrixXd P_null = Eigen::MatrixXd::Identity(22, 22) - 
+                         J_left.transpose() * (J_left * J_left.transpose()).inverse() * J_left;
+Eigen::VectorXd F_secondary = computeTorsoPostureForce();
+Eigen::VectorXd tau_secondary = P_null * J_torso.transpose() * F_secondary;
+
+// 总控制力矩
+Eigen::VectorXd tau = J_left.transpose() * F_primary + tau_secondary;
+\end{lstlisting}
+
+\subsection{计算复杂度（全身系统）}
+
+对于全身系统（$N=22$ 自由度）：
+
+\begin{itemize}
+    \item \textbf{质量矩阵计算：} $O(N^2) = O(484)$
+    \item \textbf{科氏力矩阵计算：} $O(N^2)$
+    \item \textbf{重力项计算：} $O(N)$
+    \item \textbf{总复杂度：} $O(N^2)$
+\end{itemize}
+
+\textbf{对比：}
+\begin{itemize}
+    \item 单臂（7自由度）：$O(49)$
+    \item 双臂（14自由度）：$O(196)$
+    \item 全身（22自由度）：$O(484)$
+\end{itemize}
+
+虽然计算复杂度增加，但 Pinocchio 的高效递归算法（RNEA）仍能满足实时控制需求（通常 $< 1$ ms）。
+
+\section{总结}
+
+\begin{itemize}
+    \item \textbf{Pinocchio 完全支持全身系统：} 包括底盘、腰部（折叠+旋转）、双臂等复杂结构
+    \item \textbf{统一的计算接口：} 无论系统多复杂，都使用相同的 \texttt{computeAllTerms()} 函数
+    \item \textbf{自动处理耦合：} Pinocchio 自动计算所有部分之间的动力学耦合
+    \item \textbf{代码改动最小：} 主要改动是向量维度，核心计算逻辑不变
+    \item \textbf{腰部关节的影响：} 折叠和旋转关节会影响整个上身的动力学，这些影响会自动包含在计算结果中
+    \item \textbf{性能考虑：} 全身系统的计算复杂度较高，但 Pinocchio 的高效实现仍能满足实时控制需求
+\end{itemize}
+
+\section{参考文献}
+
+\begin{enumerate}
+    \item Pinocchio Documentation: \url{https://stack-of-tasks.github.io/pinocchio/}
+    \item Featherstone, R. (2008). \textit{Rigid Body Dynamics Algorithms}. Springer.
+    \item \texttt{hybrid\_force\_position\_control.cpp} - ROKAE xCore SDK 示例代码
+\end{enumerate}
+
+\end{document}
+
