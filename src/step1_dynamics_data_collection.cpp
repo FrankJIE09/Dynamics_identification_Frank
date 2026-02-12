@@ -1,5 +1,5 @@
 /**
- * @file dynamics_data_collection.cpp
+ * @file step1_dynamics_data_collection.cpp
  * @brief 实时模式 - 动力学参数辨识数据采集
  * 
  * 此程序用于采集机器人动力学辨识所需的数据：
@@ -121,13 +121,13 @@ void collectDynamicsData(xMateErProRobot &robot, const std::string& output_file 
   // 获取初始位置
   std::cout << "  获取初始位置..." << std::endl;
   std::array<double, 7> q_init = Utils::degToRad(std::array<double, 7>({
-    -2.458,   // 一轴：-2.458度
-    -70.651,  // 二轴：-70.651度
-    -2.044,   // 三轴：-2.044度
-    118.492,  // 四轴：118.492度
-    4.682,    // 五轴：4.682度
-    -47.719,  // 六轴：-47.719度
-    -5.433    // 七轴：-5.433度
+    -0.458,   // 一轴：-2.458度
+    -0.651,  // 二轴：-70.651度
+    -0.044,   // 三轴：-2.044度
+    0.492,  // 四轴：118.492度
+    0.682,    // 五轴：4.682度
+    -0.719,  // 六轴：-47.719度
+    -0.433    // 七轴：-5.433度
   }));
   std::cout << "  初始位置（度）: [";
   for (size_t i = 0; i < q_init.size(); i++) {
@@ -159,7 +159,7 @@ void collectDynamicsData(xMateErProRobot &robot, const std::string& output_file 
 
   // 激励轨迹参数（降低幅值和频率以减小角速度）
   std::array<double, 7> amplitudes = {
-    0.15, 0.15, 0.15, 0.15, 0.1, 0.1, 0.1  // 各关节幅值（弧度）
+    0.45, 0.45, 0.45, 0.5, 0.5, 0.5, 0.5  // 各关节幅值（弧度）
   };
   std::array<double, 7> frequencies = {
     0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8  // 各关节频率（rad/s）
@@ -344,7 +344,7 @@ int main(int argc, char * argv[])
   std::cout << "========================================" << std::endl;
   
   // 解析命令行参数
-  std::string robot_ip = "192.168.110.15";  // 默认机器人IP
+  std::string robot_ip = "10.17.0.110";  // 默认机器人IP
   std::string output_file = "dynamics_identification_data.csv";  // 默认输出文件
   
   if (argc > 1) {

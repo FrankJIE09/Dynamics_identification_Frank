@@ -1,5 +1,5 @@
 /**
- * @file dynamics_parameter_estimation.cpp
+ * @file step2_dynamics_parameter_estimation.cpp
  * @brief 动力学参数辨识计算程序
  * 
  * 此程序用于从采集的数据中辨识机器人的动力学参数：
@@ -24,6 +24,7 @@
 #include <chrono>
 #include <sstream>
 #include <string>
+#include <map>
 #include "Eigen/Geometry"
 #include "Eigen/Dense"
 
@@ -51,6 +52,138 @@ struct DataPoint {
     std::array<double, 7> tau;    // 关节力矩 (Nm，传感器测量)
     double timestamp;             // 时间戳 (s)
 };
+
+/**
+ * @brief 生成新的URDF文件（更新惯性参数）
+ */
+void generateIdentifiedURDF(const std::string& original_urdf_file, 
+                             const std::string& output_urdf_file,
+                             const pinocchio::Model& pinocchio_model,
+                             const Eigen::VectorXd& theta_estimated) {
+  std::ifstream in_file(original_urdf_file);
+  if (!in_file.is_open()) {
+    std::cerr << "  警告: 无法打开原始URDF文件: " << original_urdf_file << std::endl;
+    return;
+  }
+  
+  // 读取所有行
+  std::vector<std::string> lines;
+  std::string line;
+  while (std::getline(in_file, line)) {
+    lines.push_back(line);
+  }
+  in_file.close();
+  
+  // 存储每个 link 的新 inertial 内容（仅 7 个连杆，与 theta_estimated 的 70 维对应）
+  const int n_inertial_links = std::min(7, static_cast<int>(theta_estimated.size() / 10));
+  std::map<std::string, std::string> link_inertial_map;
+  for (int j = 0; j < n_inertial_links; ++j) {
+    const pinocchio::JointIndex jid = static_cast<pinocchio::JointIndex>(j + 1);
+    const int base = 10 * j;
+    const auto pi_id = theta_estimated.segment(base, 10);
+    const auto inertia_id = pinocchio::Inertia::FromDynamicParameters(pi_id);
+
+    const double m_id = inertia_id.mass();
+    const Eigen::Vector3d c_id = inertia_id.lever();
+    const Eigen::Matrix3d I_id = inertia_id.inertia();
+
+    std::string link_name = pinocchio_model.names[jid];
+
+    std::ostringstream inertial_oss;
+    inertial_oss << "    <inertial>\n";
+    inertial_oss << "      <mass value=\"" << std::fixed << std::setprecision(6) << m_id << "\" />\n";
+    inertial_oss << "      <inertia ixx=\"" << std::scientific << std::setprecision(10) << I_id(0,0)
+                 << "\" ixy=\"" << I_id(0,1) << "\" ixz=\"" << I_id(0,2)
+                 << "\" iyy=\"" << I_id(1,1) << "\" iyz=\"" << I_id(1,2)
+                 << "\" izz=\"" << I_id(2,2) << "\" />\n";
+    inertial_oss << "      <origin rpy=\"0 0 0\" xyz=\"" << std::fixed << std::setprecision(6)
+                 << c_id(0) << " " << c_id(1) << " " << c_id(2) << "\" />\n";
+    inertial_oss << "    </inertial>\n";
+    link_inertial_map[link_name] = inertial_oss.str();
+    // 同时用 "AR5-5_07R-W4C4A2_linkN" 形式匹配（若 Pinocchio 只返回 linkN）
+    if (link_name.find("AR5-5") == std::string::npos && link_name.find("link") != std::string::npos) {
+      link_inertial_map["AR5-5_07R-W4C4A2_" + link_name] = link_inertial_map[link_name];
+    }
+  }
+  
+  // 处理每一行，找到并替换inertial标签
+  std::ofstream out_file(output_urdf_file);
+  if (!out_file.is_open()) {
+    std::cerr << "  警告: 无法创建输出URDF文件: " << output_urdf_file << std::endl;
+    return;
+  }
+  
+  std::string current_link_name;
+  bool in_inertial = false;
+  bool inertial_replaced = false;
+  int inertial_indent = 0;
+  
+  for (size_t i = 0; i < lines.size(); ++i) {
+    line = lines[i];
+
+    size_t link_pos = line.find("<link name=\"");
+    if (link_pos != std::string::npos) {
+      size_t name_start = link_pos + 12;
+      size_t name_end = line.find("\"", name_start);
+      if (name_end != std::string::npos) {
+        current_link_name = line.substr(name_start, name_end - name_start);
+      }
+      inertial_replaced = false;
+    }
+
+    if (line.find("<inertial>") != std::string::npos && !inertial_replaced) {
+      inertial_indent = 0;
+      for (char c : line) {
+        if (c == ' ') inertial_indent++;
+        else break;
+      }
+
+      auto it = link_inertial_map.find(current_link_name);
+      if (it != link_inertial_map.end()) {
+        // 跳过旧 inertial 块内容
+        while (i + 1 < lines.size() && lines[i + 1].find("</inertial>") == std::string::npos) {
+          i++;
+        }
+        const std::string& new_inertial = it->second;
+        std::string indent_str(inertial_indent, ' ');
+        std::istringstream iss(new_inertial);
+        std::string new_line;
+        while (std::getline(iss, new_line)) {
+          if (new_line.length() >= 4 && new_line.substr(0, 4) == "    ") {
+            new_line = new_line.substr(4);
+          }
+          out_file << indent_str << new_line << "\n";
+        }
+        out_file.flush();
+        i++;
+        in_inertial = false;
+        inertial_replaced = true;
+        continue;
+      }
+
+      in_inertial = true;
+      out_file << line << "\n";
+      continue;
+    }
+
+    if (in_inertial) {
+      out_file << line << "\n";
+      if (line.find("</inertial>") != std::string::npos) {
+        in_inertial = false;
+      }
+      continue;
+    }
+
+    if (inertial_replaced && line.find("</inertial>") != std::string::npos) {
+      continue;
+    }
+
+    out_file << line << "\n";
+  }
+  
+  out_file.close();
+  std::cout << "  已生成新的URDF文件: " << output_urdf_file << std::endl;
+}
 
 /**
  * @brief 从CSV文件读取数据
@@ -497,6 +630,11 @@ void estimateDynamicsParameters(const std::string& data_file, const std::string&
                         << tau0(6) << "]\n";
     physical_param_file.close();
     std::cout << "  已保存: dynamics_physical_parameters_identified.txt" << std::endl;
+    
+    // 生成新的URDF文件
+    std::cout << "\n  生成新的URDF文件..." << std::endl;
+    std::string output_urdf = "AR5-5_07R-W4C4A2_identified.urdf";
+    generateIdentifiedURDF(urdf_file, output_urdf, pinocchio_model, theta_estimated);
   } else {
     std::cout << "\n  跳过物理参数重建：当前theta不是每关节10维惯性参数形式（n_params=" << n_params << "）。" << std::endl;
   }

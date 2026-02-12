@@ -1,158 +1,133 @@
-# 动力学辨识归档包（xCoreSDK_cpp-v0.5.1）
+# 动力学辨识（Dynamics Identification）
 
-本文件夹用于**长期保存**本次“动力学数据采集 + Pinocchio 回归辨识 + 结果导出 + URDF 更新”相关代码与产物（仅归档，不影响原工程）。
+基于 Pinocchio 的机械臂动力学参数辨识：从 DH/URDF 到数据采集、回归辨识、结果导出与 URDF 更新。
 
 ---
 
 ## 目录结构
 
-- `src/`
-  - `dynamics_data_collection.cpp`：上电、进入RT、执行激励轨迹、采集 `q/dq/ddq/tau` 并保存 CSV
-  - `dynamics_parameter_estimation.cpp`：离线读取 CSV，用 Pinocchio 构建回归矩阵并辨识参数，输出结果文件
-  - `dynamics_identification.cpp`：历史/合并版（保留参考）
-  - `CMakeLists_rt.txt`：当时 `example/rt/CMakeLists.txt` 的快照
-- `build_outputs/`（运行产物）
-  - `dynamics_identification_data.csv`：采集数据（大文件）
-  - `dynamics_identification_results.txt`：辨识摘要与误差评估
-  - `dynamics_parameters.csv`：带 URDF 先验的 Ridge 结果
-  - `dynamics_parameters_ls.csv`：纯最小二乘（SVD）结果
-  - `dynamics_parameters_urdf.csv`：URDF 对应参数（先验）
-  - `dynamics_physical_parameters.txt`：URDF 物理参数导出（参考）
-  - `dynamics_physical_parameters_identified.txt`：由辨识参数重建的物理参数（对比用）
-- `urdf/`
-  - `AR5-5_07R-W4C4A2.urdf`：原始URDF
-  - `AR5-5_07R-W4C4A2_identified.urdf`：**带“换算/正定化”处理**后的 identified URDF（更稳）
-  - `AR5-5_07R-W4C4A2_identified_direct_from_txt.urdf`：**严格按 txt 直接覆盖**（不换算/不正定化，可能包含负惯性）
-  - `generate_identified_urdf.py`：从 `dynamics_physical_parameters_identified.txt` 生成 identified URDF 的脚本
-- `docs/`
-  - `pinocchio_dynamics*.tex` 等：Pinocchio 动力学/辨识/双臂/运动学辨识说明文档
-- `MANIFEST.txt`
-  - 本归档的文件清单（含大小、时间）
+```
+├── CMakeLists.txt          # 本仓库独立编译（step2 等）
+├── src/
+│   ├── step0_dh_to_urdf.py           # Step0: DH → URDF（标准 DH）
+│   ├── step0_mdh_to_urdf.py           # Step0: MDH → URDF（修正 DH）
+│   ├── step1_dynamics_data_collection*.cpp   # Step1: 在线数据采集（需 Rokae SDK）
+│   ├── step2_dynamics_parameter_estimation.cpp      # Step2: 离线参数辨识
+│   ├── step2.2_dynamics_parameter_estimation_joint.cpp  # Step2.2: 惯性+摩擦联合辨识
+│   ├── dynamics_parameter_estimation.cpp   # 早期版辨识程序（保留）
+│   ├── dynamics_data_collection.cpp
+│   ├── dynamics_identification.cpp
+│   └── CMakeLists_rt.txt   # xCoreSDK 工程内使用的 CMake 快照
+├── urdf/
+│   ├── AR5-5_07R-W4C4A2.urdf              # 原始/标称 URDF
+│   ├── AR5-5_07R-W4C4A2_ Manual_fix.urdf   # 手动修正 URDF（可选）
+│   ├── AR5-5_07R-W4C4A2_identified.urdf    # 辨识后 URDF（推荐）
+│   ├── AR5-5_07R-W4C4A2_identified_direct_from_txt.urdf
+│   └── generate_identified_urdf.py        # 从辨识结果生成 identified URDF
+├── build_outputs/         # 推荐放置采集数据与辨识产物的目录
+│   ├── dynamics_identification_data.csv   # 采集数据 (q,dq,ddq,tau)
+│   ├── dynamics_identification_results.txt
+│   ├── dynamics_parameters*.csv
+│   └── dynamics_physical_parameters_identified.txt
+└── docs/                  # Pinocchio 动力学/辨识说明文档 (.tex)
+```
 
 ---
 
-## 推荐工作流（最常用）
+## 依赖
 
-## 如何编译（从源码到可执行文件）
+- **Eigen3**、**Pinocchio**：本仓库内编译 step2 所需（如通过 ROS Humble 或系统安装）。
+- **Rokae xCore SDK**（仅 step1 数据采集）：需在 xCoreSDK 工程内编译 step1 可执行文件。
 
-> 说明：归档包里保存的是源码快照；**实际编译请在工程目录** `03_control_system/xCoreSDK_cpp-v0.5.1/` 下进行。
+---
 
-### 依赖前提
+## 编译（本仓库）
 
-- **必须**：开启 xMateModel（否则相关 target 不会生成）
-  - CMake 选项：`-DXCORE_USE_XMATE_MODEL=ON`
-- **需要 Pinocchio 的程序**：
-  - `dynamics_parameter_estimation`
-  - `dynamics_identification`
-  -（如果系统已安装到 `/opt/ros/humble` 或系统路径，一般可直接找到）
-
-### 编译命令（推荐）
-
-在工程目录执行：
+在项目根目录执行：
 
 ```bash
-cd /home/lenovo/Frank/doc/rokae_arm_source/03_control_system/xCoreSDK_cpp-v0.5.1
 mkdir -p build
-cmake -S . -B build -DXCORE_USE_XMATE_MODEL=ON
-cmake --build build -j"$(nproc)" --target dynamics_data_collection dynamics_parameter_estimation dynamics_identification
+cmake -S . -B build
+cmake --build build -j$(nproc)
 ```
 
-编译成功后，可执行文件通常在：
+生成的可执行文件在 `build/` 下：
 
-- `build/bin/dynamics_data_collection`
-- `build/bin/dynamics_parameter_estimation`
-- `build/bin/dynamics_identification`
+| 可执行文件 | 说明 |
+|------------|------|
+| `dynamics_parameter_estimation` | 离线辨识（早期版） |
+| `step2_dynamics_parameter_estimation` | 离线辨识，支持生成 identified URDF |
+| `step2_2_dynamics_parameter_estimation_joint` | 惯性 + 摩擦联合辨识 |
 
-### 1) 采集数据（在线，接机器人）
-
-使用工程里编译出来的 `dynamics_data_collection` 采集，得到：
-
-- `build_outputs/dynamics_identification_data.csv`
-
-> 归档包里只保存源码与产物；实际可执行文件在工程的 `build/bin` 下。
-
-#### 运行方法（推荐用这个程序采集）
-
-```bash
-cd /home/lenovo/Frank/doc/rokae_arm_source/03_control_system/xCoreSDK_cpp-v0.5.1/build/bin
-./dynamics_data_collection <robot_ip> <output_csv>
-```
-
-- **robot_ip**：机器人控制器IP（默认示例里是 `192.168.110.15`）
-- **output_csv**：输出CSV文件名（默认 `dynamics_identification_data.csv`）
-- 程序会自动检测**本机IP**（要求本机网卡与机器人同网段）
-
-输出文件（默认）：
-
-- `dynamics_identification_data.csv`（采集到的 `time,q,dq,ddq,tau`）
-
-### 2) 参数辨识（离线）
-
-用 `dynamics_parameter_estimation` 读取 CSV 并输出：
-
-- `dynamics_identification_results.txt`
-- `dynamics_parameters*.csv`
-- `dynamics_physical_parameters_identified.txt`
-
-#### 运行方法（离线辨识）
-
-```bash
-cd /home/lenovo/Frank/doc/rokae_arm_source/03_control_system/xCoreSDK_cpp-v0.5.1/build/bin
-./dynamics_parameter_estimation <data_csv> [urdf_path]
-```
-
-- **data_csv**：采集得到的CSV（例如 `dynamics_identification_data.csv`）
-- **urdf_path**：可选；不传时默认使用编译期注入的 `URDF_FILE_PATH`（避免相对路径坑）
-
-典型输出（在运行目录下生成/更新）：
-
-- `dynamics_identification_results.txt`：整体误差、每关节RMSE等
-- `dynamics_parameters.csv`：带URDF先验Ridge的参数
-- `dynamics_parameters_ls.csv`：纯最小二乘（SVD）参数
-- `dynamics_parameters_urdf.csv`：URDF先验参数向量
-- `dynamics_physical_parameters_identified.txt`：把参数重建为质量/质心/惯性用于对比
-
-### 3) 生成新的 URDF
-
-#### 方式A（推荐更稳）：换算到质心 + 正定化
-
-使用 `urdf/generate_identified_urdf.py` 生成 `AR5-5_07R-W4C4A2_identified.urdf` 风格的URDF。
-
-#### 方式B（严格按 txt 直接写入）：不换算/不正定化
-
-`urdf/AR5-5_07R-W4C4A2_identified_direct_from_txt.urdf` 就是这种方式的结果。
+**说明**：`step1_dynamics_data_collection` 与 `step1_dynamics_data_collection_joint` 依赖 Rokae SDK（`rokae/robot.h`、`print_helper.hpp`），本仓库不包含这些依赖，需在 **xCoreSDK 工程**（如 `xCoreSDK_cpp-v0.5.1`）下打开对应 target 后编译。
 
 ---
 
-## 重要注意事项（强烈建议读）
+## 使用流程
 
-- **惯性参考点问题**：`dynamics_physical_parameters_identified.txt` 里打印的“辨识惯性矩阵”与 URDF `<inertia>` 期望的参考点可能不同（是否为质心）。如果你“直接覆盖”，理论上可能把参考点写错。
-- **物理可行性问题**：辨识得到的惯性矩阵可能出现**负惯性/非正定**，直接写入 URDF 可能导致后续动力学/仿真数值不稳定甚至崩溃。
-- **先验与不可辨识方向**：当回归矩阵秩不足时，部分参数不可辨识，Ridge/URDF先验会影响这些方向上的结果，这属于预期行为。
+### Step0：DH → URDF（可选）
 
----
-
-## `dynamics_identification.cpp`（历史/合并版）怎么用？
-
-该程序把“在线采集 + 离线计算”揉在一起，主要用于早期调试验证，当前仍保留用于参考。
-
-运行方式：
+根据 DH/MDH 参数生成或修正 URDF，无需编译，直接运行：
 
 ```bash
-cd /home/lenovo/Frank/doc/rokae_arm_source/03_control_system/xCoreSDK_cpp-v0.5.1/build/bin
-./dynamics_identification
+python3 src/step0_dh_to_urdf.py    # 标准 DH
+python3 src/step0_mdh_to_urdf.py   # 修正 DH
 ```
 
-注意：
+按脚本内注释修改 DH 表与输入/输出路径即可。
 
-- 它的 `robot_ip` 在源码里是**写死的**（默认 `192.168.110.15`），如需修改请改源码后重新编译。
-- 它会在运行目录下写出 `dynamics_identification_data.csv` 等文件（具体以程序输出为准）。
+### Step1：数据采集（需接机与 xCoreSDK）
+
+在 **xCoreSDK 工程** 下编译并运行数据采集程序，得到 `dynamics_identification_data.csv`（包含 `time, q, dq, ddq, tau`）。将生成的 CSV 放到本仓库的 `build_outputs/` 或任意路径备用。
+
+### Step2：参数辨识（本仓库编译的程序）
+
+在 `build` 目录下运行，**参数顺序**：`<数据 CSV> [URDF 路径]`。
+
+```bash
+cd build
+
+# 使用默认 URDF（CMake 中设置的默认路径）
+./dynamics_parameter_estimation ../build_outputs/dynamics_identification_data.csv
+./step2_dynamics_parameter_estimation ../build_outputs/dynamics_identification_data.csv
+./step2_2_dynamics_parameter_estimation_joint ../build_outputs/dynamics_identification_data.csv
+
+# 指定不同 URDF（例如手动修正的 URDF，路径含空格时请加引号）
+./dynamics_parameter_estimation ../build_outputs/dynamics_identification_data.csv "../urdf/AR5-5_07R-W4C4A2_ Manual_fix.urdf"
+./step2_dynamics_parameter_estimation ../build_outputs/dynamics_identification_data.csv "../urdf/AR5-5_07R-W4C4A2_ Manual_fix.urdf"
+./step2_2_dynamics_parameter_estimation_joint ../build_outputs/dynamics_identification_data.csv "../urdf/AR5-5_07R-W4C4A2_ Manual_fix.urdf"
+```
+
+辨识结果会写在**当前工作目录**（即 `build/`）下，例如：
+
+- `dynamics_identification_results.txt` — 整体 RMSE、各关节误差
+- `dynamics_parameters.csv` / `dynamics_parameters_ls.csv` / `dynamics_parameters_urdf.csv`
+- `dynamics_physical_parameters_identified.txt` — 辨识得到的质量/质心/惯性（与 URDF 对比）
+
+### 指定不同 URDF
+
+- **运行时**：如上，第二个命令行参数传入 URDF 路径（相对或绝对均可）。
+- **编译默认值**：在 `CMakeLists.txt` 中修改 `URDF_FILE_PATH`，不传第二个参数时生效。
+
+### Step3：生成辨识后的 URDF
+
+使用 `urdf/generate_identified_urdf.py`，根据 `dynamics_physical_parameters_identified.txt` 和原始 URDF 生成带“换算/正定化”的 identified URDF（推荐）。用法见脚本内说明或：
+
+```bash
+python3 urdf/generate_identified_urdf.py
+```
 
 ---
 
-## 版本信息
+## 注意事项
 
-- 归档创建时间：2026-01-20
-- 对应工程：`03_control_system/xCoreSDK_cpp-v0.5.1/`
+- **惯性参考点**：辨识得到的惯性矩阵与 URDF `<inertial>` 的参考点（是否在质心）可能不一致，生成 URDF 时脚本会做换算与正定化。
+- **回归矩阵秩**：若不满秩，部分参数不可辨识，程序会使用 URDF 先验（Ridge）填补；可增加激励多样性或采集时长以改善。
+- **step1**：仅能在配备 Rokae SDK 的 xCoreSDK 工程中编译与运行，本仓库仅提供 step2 的独立编译与运行说明。
 
+---
 
+## 版本与参考
+
+- 本仓库可独立完成：Step0（Python）、Step2 编译与运行、URDF 生成。
+- 数据采集（Step1）依赖 xCoreSDK 与实机/仿真环境。

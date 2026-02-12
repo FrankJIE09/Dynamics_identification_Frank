@@ -31,4 +31,7 @@ build_outputs/dynamics_identification_data.csv
 build_outputs/*.tmp
 build_outputs/*.log
 
+# CMake 编译目录与可执行文件（不提交）
+build/
+
 
