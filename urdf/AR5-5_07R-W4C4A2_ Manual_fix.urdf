@@ -28,21 +28,14 @@
   <material name="Beige">
     <color rgba="1.0 0.784 0.5765 1.0"/>
   </material>
-  <link name="world">
-    <inertial>
-      <mass value="0.001"/>
-      <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9"/>
-    </inertial>
-  </link>
+  <!-- Used for fixing robot to Gazebo 'base_link' -->
+  <link name="world"/>
   <joint name="fixed" type="fixed">
     <parent link="world"/>
     <child link="AR5-5_07R-W4C4A2_base"/>
   </joint>
+  <!--base-->
   <link name="AR5-5_07R-W4C4A2_base">
-    <inertial>
-      <mass value="0.001"/>
-      <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9"/>
-    </inertial>
     <visual>
       <geometry>
         <mesh filename="package://AR5-5_07R-W4C4A2_description/meshes/AR5-5_07R-W4C4A2_base.stl" scale="0.001 0.001 0.001"/>

@@ -10,7 +10,7 @@ find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(pinocchio REQUIRED)
 
 # URDF 默认路径（相对于项目根目录）
-set(URDF_FILE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/urdf/AR5-5_07R-W4C4A2.urdf")
+set(URDF_FILE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/urdf/AR5-5_07R-W4C4A2_ Manual_fix.urdf")
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/dynamics_parameter_estimation.cpp")
   add_executable(dynamics_parameter_estimation src/dynamics_parameter_estimation.cpp)

@@ -56,7 +56,7 @@
     <limit effort="108" lower="-3.1067" upper="3.1067" velocity="3.0543261909900763"/>
     <axis xyz="0 0 1"/>
     <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
-        <dynamics damping="0.065375" friction="0.323997" />
+        <dynamics damping="0.065357" friction="0.323985" />
   </joint>
   <transmission name="tran1">
     <type>transmission_interface/SimpleTransmission</type>
@@ -94,8 +94,8 @@
     <child link="AR5-5_07R-W4C4A2_link2"/>
     <limit effort="108" lower="-2.0944" upper="2.0944" velocity="3.0543261909900763"/>
     <axis xyz="0 1 0"/>
-    <origin rpy="0 0 0" xyz="0.0 0.0 0.1745"/>
-        <dynamics damping="0.002226" friction="-0.333806" />
+    <origin rpy="0 0 0" xyz="0.0 0.0 0.174522"/>
+        <dynamics damping="0.002218" friction="-0.333801" />
   </joint>
   <transmission name="tran2">
     <type>transmission_interface/SimpleTransmission</type>
@@ -133,8 +133,8 @@
     <child link="AR5-5_07R-W4C4A2_link3"/>
     <limit effort="66" lower="-3.1067" upper="3.1067" velocity="4.71238898038469"/>
     <axis xyz="0 0 1"/>
-    <origin rpy="0 0 0" xyz="0.0 0.0 0.314"/>
-        <dynamics damping="0.144358" friction="0.178865" />
+    <origin rpy="0 0 0" xyz="0.0 0.0 0.314726"/>
+        <dynamics damping="0.144342" friction="0.178867" />
   </joint>
   <transmission name="tran3">
     <type>transmission_interface/SimpleTransmission</type>
@@ -175,7 +175,7 @@
     <axis xyz="0 1 0"/>
     <!--     <origin rpy="0 0 0" xyz=0.01 0.0 0.0/> -->
     <origin rpy="0 0 0" xyz="0.01 0.0 0.0"/>
-        <dynamics damping="0.001017" friction="0.201426" />
+        <dynamics damping="0.001017" friction="0.201492" />
   </joint>
   <transmission name="tran4">
     <type>transmission_interface/SimpleTransmission</type>
@@ -213,8 +213,8 @@
     <child link="AR5-5_07R-W4C4A2_link5"/>
     <limit effort="19" lower="-3.1067" upper="3.1067" velocity="4.1887902047863905"/>
     <axis xyz="0 0 1"/>
-    <origin rpy="0 0 0" xyz="-0.01 0.0 0.272"/>
-        <dynamics damping="0.104194" friction="0.120253" />
+    <origin rpy="0 0 0" xyz="-0.01 0.0 0.272656"/>
+        <dynamics damping="0.104162" friction="0.120249" />
   </joint>
   <transmission name="tran5">
     <type>transmission_interface/SimpleTransmission</type>
@@ -253,7 +253,7 @@
     <limit effort="19" lower="-1.0472" upper="1.0472" velocity="4.1887902047863905"/>
     <axis xyz="0 1 0"/>
     <origin rpy="0.0 0.0 0" xyz="0.0 0.0 0.0"/>
-        <dynamics damping="0.071664" friction="0.348288" />
+        <dynamics damping="0.071730" friction="0.348274" />
   </joint>
   <transmission name="tran6">
     <type>transmission_interface/SimpleTransmission</type>
@@ -292,7 +292,7 @@
     <limit effort="19" lower="-1.0472" upper="1.0472" velocity="4.1887902047863905"/>
     <axis xyz="1 0 0"/>
     <origin rpy="0.0 0.0 0" xyz="0.0 0.0 0.0"/>
-        <dynamics damping="0.081275" friction="0.088586" />
+        <dynamics damping="0.081266" friction="0.088584" />
   </joint>
   <transmission name="tran7">
     <type>transmission_interface/SimpleTransmission</type>
@@ -334,6 +334,6 @@
   <joint name="AR5-5_07R-W4C4A2_tcp_joint" type="fixed">
     <parent link="AR5-5_07R-W4C4A2_link7"/>
     <child link="AR5-5_07R-W4C4A2_tcp"/>
-    <origin rpy="0 0 0" xyz="0.0 0.0 0.097"/>
+    <origin rpy="0 0 0" xyz="0.0 0.0 0.0968883"/>
   </joint>
 </robot>
