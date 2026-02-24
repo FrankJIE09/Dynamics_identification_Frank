@@ -87,7 +87,12 @@ void generateIdentifiedURDF(const std::string& original_urdf_file,
     const Eigen::Vector3d c_id = inertia_id.lever();
     const Eigen::Matrix3d I_id = inertia_id.inertia();
 
-    std::string link_name = pinocchio_model.names[jid];
+    std::string joint_name = pinocchio_model.names[jid];  // Pinocchio 的 names[] 是关节名，如 joint_1
+    // URDF 中 <link name="..."> 是连杆名，如 link1；关节 jid 的 child link 对应 linkN，需从 joint 名推导
+    std::string link_name = joint_name;
+    size_t jpos = joint_name.find("joint_");
+    if (jpos != std::string::npos)
+      link_name = joint_name.substr(0, jpos) + "link" + joint_name.substr(jpos + 6);  // joint_1 -> link1
 
     std::ostringstream inertial_oss;
     inertial_oss << "    <inertial>\n";
