@@ -9,8 +9,20 @@ find_package(Eigen3 REQUIRED NO_MODULE)
 # Pinocchio
 find_package(pinocchio REQUIRED)
 
+# OSQP (QP solver for step2)
+include(FetchContent)
+FetchContent_Declare(osqp
+  GIT_REPOSITORY https://github.com/osqp/osqp.git
+  GIT_TAG v0.6.3
+)
+set(UNITTESTS OFF CACHE BOOL "" FORCE)
+set(PYTHON OFF CACHE BOOL "" FORCE)
+set(MATLAB OFF CACHE BOOL "" FORCE)
+set(R_LANG OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(osqp)
+
 # URDF 默认路径（相对于项目根目录）
-set(URDF_FILE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/urdf/AR5-5_07R-W4C4A2_ Manual_fix.urdf")
+set(URDF_FILE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/urdf/AR5-5_07R-W4C4A2_Manual_fix.urdf")
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/dynamics_parameter_estimation.cpp")
   add_executable(dynamics_parameter_estimation src/dynamics_parameter_estimation.cpp)
@@ -32,6 +44,7 @@ target_include_directories(step2_dynamics_parameter_estimation PRIVATE
 target_link_libraries(step2_dynamics_parameter_estimation PRIVATE
   Eigen3::Eigen
   pinocchio::pinocchio
+  osqpstatic
 )
 target_compile_definitions(step2_dynamics_parameter_estimation PRIVATE
   URDF_FILE_PATH="${URDF_FILE_PATH}"
@@ -40,6 +53,23 @@ target_compile_definitions(step2_dynamics_parameter_estimation PRIVATE
 if(MSVC)
   target_compile_definitions(step2_dynamics_parameter_estimation PRIVATE _USE_MATH_DEFINES)
 endif()
+# 在 build 下建立符号链接：config 内 yaml、数据 CSV，以及 urdf 目录；从 build 运行时可读同一份文件
+add_custom_command(TARGET step2_dynamics_parameter_estimation POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/config
+  COMMAND ${CMAKE_COMMAND} -E remove -f ${CMAKE_CURRENT_BINARY_DIR}/config/step2_dynamics_parameter_estimation.yaml
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/config/step2_dynamics_parameter_estimation.yaml
+    ${CMAKE_CURRENT_BINARY_DIR}/config/step2_dynamics_parameter_estimation.yaml
+  COMMAND ${CMAKE_COMMAND} -E remove -f ${CMAKE_CURRENT_BINARY_DIR}/config/dynamics_identification_data.csv
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/config/dynamics_identification_data.csv
+    ${CMAKE_CURRENT_BINARY_DIR}/config/dynamics_identification_data.csv
+  COMMAND ${CMAKE_COMMAND} -E remove -f ${CMAKE_CURRENT_BINARY_DIR}/urdf
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+    ${CMAKE_CURRENT_SOURCE_DIR}/urdf
+    ${CMAKE_CURRENT_BINARY_DIR}/urdf
+  COMMENT "创建 config/yaml、config/数据CSV 与 urdf 的符号链接"
+)
 
 # ---- step2.2_dynamics_parameter_estimation_joint ----
 add_executable(step2_2_dynamics_parameter_estimation_joint

@@ -1,0 +1,59 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{bm}
+
+\geometry{margin=2.5cm}
+
+\title{URDF 与 Pinocchio 惯量均为绕质心约定}
+\author{Dynamics\_identification\_Frank}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\textbf{核心结论：}URDF 中 \texttt{<inertial>} 的 \texttt{<inertia>} 与 Pinocchio 中 \texttt{Inertia} 的转动惯量矩阵，\textbf{均为绕质心} $I_C$。辨识程序写回 URDF 时必须使用绕质心惯量，才能与 Pinocchio 读回后的 \texttt{toDynamicParameters()} 一致，保证 $\theta$ 写/读零差异。
+\end{abstract}
+
+\section{约定说明}
+
+\subsection{URDF 约定}
+
+在 URDF 中，\texttt{<inertial>} 块为：
+\begin{itemize}[leftmargin=*]
+  \item \texttt{<origin xyz="cx cy cz"/>}：质心在连杆坐标系下的位置；
+  \item \texttt{<inertia ixx=... ixy=... />}：\textbf{绕该惯性系原点（即质心）}的 $3\times 3$ 转动惯量，即 $I_C$。
+\end{itemize}
+因此 URDF 文件中的惯量语义是\textbf{绕质心} $I_C$。
+
+\subsection{Pinocchio 约定}
+
+Pinocchio 的 \texttt{Inertia} 类由 \texttt{FromDynamicParameters(}$\pi$\texttt{)} 构造，其中 $\pi$ 为 10 维动力学参数 $(m,\,m c_x,\,m c_y,\,m c_z,\,I_{xx},\,I_{xy},\,I_{xz},\,I_{yy},\,I_{yz},\,I_{zz})$。该类内部保存质心位置 \texttt{lever} 与转动惯量矩阵。\textbf{该转动惯量矩阵为绕质心} $I_C$，与 URDF 约定一致。
+
+\subsection{写回 URDF 时必须使用绕质心惯量}
+
+辨识得到的 $\theta$（或 $\pi$）经 \texttt{Inertia::FromDynamicParameters} 得到 \texttt{inv\_id} 后：
+\begin{itemize}[leftmargin=*]
+  \item 写入 URDF 的 \texttt{<inertia>} 应使用 \textbf{\texttt{inv\_id.inertia()} 的 3$\times$3 矩阵}（即 $I_C$），与 \texttt{<origin xyz>} 质心位置一致；
+  \item 若误将绕连杆原点的 $I_{\mathrm{origin}}$ 写入 URDF，解析器会按“绕质心”解释并再做平行轴转换，导致读回 $\theta$ 与内存 $\theta$ 出现约 2 倍等错误，写/读不一致。
+\end{itemize}
+
+\section{代码中的体现}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{C++}（\texttt{step2\_dynamics\_parameter\_estimation.cpp}）：使用 \texttt{pi\_id(4)\ldots pi\_id(9)} 写入 URDF，与 Pinocchio 10 维参数中 $I_C$ 部分一致；注释中明确“\texttt{<inertia>} 为质心处惯性 $I_C$”。
+  \item \textbf{Python 含摩擦}（\texttt{step2\_dynamics\_parameter\_estimation\_friction.py}）：使用 \texttt{inv\_id.inertia} 的 3$\times$3 矩阵写入，与 $\theta$ 的 $I$ 部分一致，均为绕质心。
+  \item \textbf{Python 无摩擦}（\texttt{step2\_dynamics\_parameter\_estimation.py}）：同样使用与 10 维参数中 $I_C$ 对应的惯量写入 URDF。
+\end{itemize}
+
+\section{小结}
+
+URDF 与 Pinocchio 的惯量\textbf{都是绕质心} $I_C$。辨识程序写 URDF 时统一使用质心处惯量（来自 \texttt{Inertia} 的 \texttt{inertia()} 或 $\theta$ 的对应分量），即可保证保存后再读回的 $\theta$ 与内存一致。
+
+\end{document}

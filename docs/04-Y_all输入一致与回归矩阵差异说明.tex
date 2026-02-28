@@ -1,0 +1,165 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{bm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+
+\geometry{margin=2.5cm}
+
+\title{Y\_all 输入数据一致与回归矩阵数值差异说明}
+\author{Dynamics\_identification\_Frank}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+在 step2 动力学参数辨识中，C++ 与 Python 使用同一份采集数据与 URDF，经对比脚本验证：用于构造回归矩阵的输入 $(q,\dot{q},\ddot{q})$ 逐样本、逐列完全一致（差为零），但回归矩阵 $Y_{\mathrm{all}}$ 的数值存在显著差异（最大绝对差约 $84.6$，相对 Frobenius 范数约 $1.42$），且 C++ 与 Python 下回归矩阵的秩分别为 45 与 7，辨识 RMSE 分别为约 $1.34\,\mathrm{Nm}$ 与 $8.67\,\mathrm{Nm}$。本文从 Pinocchio 官方文档与版本差异出发，详细解释为何“输入一致、输出不同”，并给出参考文献与建议。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{现象概述}
+%==============================================================================
+
+\subsection{对比实验设置}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{数据}：同一 CSV（\texttt{dynamics\_identification\_data.csv}），同一 URDF（\texttt{AR5-5\_07R-W4C4A2\_Manual\_fix.urdf}）。
+  \item \textbf{C++}：\texttt{step2\_dynamics\_parameter\_estimation}，从 \texttt{build/} 运行，使用系统或 CMake 配置的 Pinocchio（如 2.x）。
+  \item \textbf{Python}：\texttt{step2\_dynamics\_parameter\_estimation.py}，使用 pip/conda 安装的 \texttt{pinocchio}（可能为 2.6 或 3.x）。
+  \item \textbf{对比脚本}：\texttt{scripts/compare\_Y\_input\_and\_diff.py}，读取 \texttt{Y\_input\_cpp.csv}、\texttt{Y\_input\_py.csv} 以及 \texttt{Y\_all\_cpp.bin}、\texttt{Y\_all\_py.bin}，输出差值 CSV 与统计摘要。
+\end{itemize}
+
+\subsection{输入数据对比结果}
+
+对比脚本对 C++ 与 Python 保存的“用于构造 $Y_{\mathrm{all}}$ 的输入”逐样本、逐列求差，结果为：
+
+\begin{itemize}[leftmargin=*]
+  \item 样本数一致：3001。
+  \item 全表最大绝对差：$0$；全表平均绝对差：$0$。
+  \item 各列（$q_1\sim q_7,\, \dot{q}_1\sim \dot{q}_7,\, \ddot{q}_1\sim \ddot{q}_7$）的最大与平均绝对差均为 $0$。
+\end{itemize}
+
+因此可以确认：\textbf{两边使用的 $(q,\dot{q},\ddot{q})$ 完全一致}，即“Y\_all 使用的数据”相同。
+
+\subsection{回归矩阵与辨识结果对比}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{回归矩阵 $Y_{\mathrm{all}}$}：形状一致 $(21007\times 70)$，但数值不同：
+    \begin{itemize}
+      \item 最大绝对差：约 $8.46\times 10^1$；
+      \item 平均绝对差：约 $3.65$；
+      \item Frobenius 范数差：约 $9.71\times 10^3$，相对 $Y_{\mathrm{cpp}}$ 的 Frobenius 范数约 $1.42$。
+    \end{itemize}
+  \item \textbf{秩}：C++ 约 45，Python 约 7（相同阈值 $10^{-6}\cdot \sigma_1$）。
+  \item \textbf{辨识 RMSE}：C++ 约 $1.34\,\mathrm{Nm}$，Python 约 $8.67\,\mathrm{Nm}$。
+\end{itemize}
+
+结论：在输入 $(q,\dot{q},\ddot{q})$ 一致的前提下，\textbf{回归矩阵 $Y$ 的数值差异来自 C++ 与 Python 所调用的 Pinocchio 实现不同}（见下节）。
+
+%==============================================================================
+\section{Pinocchio 官方文档中的关节力矩回归矩阵}
+%==============================================================================
+
+\subsection{函数定义与数学关系}
+
+Pinocchio 官方文档（如 ROS Humble 下 pinocchio 3.4.0 文档\cite{ros-pinocchio-regressor}）对 \texttt{computeJointTorqueRegressor} 的说明可概括为：
+
+\begin{quote}
+\textbf{computeJointTorqueRegressor(model, data, q, v, a)}
+
+Computes the joint torque regressor that links the joint torque to the dynamic parameters of each link according to the current robot motion.
+
+The result is stored in \texttt{data.jointTorqueRegressor} and it corresponds to a matrix $Y$ such that
+\begin{equation}
+  \tau = Y(q,\dot{q},\ddot{q})\,\pi,
+  \label{eq:tauYpi}
+\end{equation}
+where $\pi = (\pi_1^\top\;\ldots\;\pi_n^\top)^\top$ and
+\begin{equation}
+  \pi_i = \texttt{model.inertias[i].toDynamicParameters()}.
+  \label{eq:pi_i}
+\end{equation}
+\end{quote}
+
+即：给定当前运动 $(q,v,a)$，$Y$ 将各连杆的动力学参数 $\pi_i$（质量、质心、惯量等 10 维）与关节力矩 $\tau$ 线性联系起来。文档还注明：该函数在计算过程中会向 \texttt{data.bodyRegressor} 写入临时信息，原有内容会被覆盖。
+
+\subsection{参数与接口}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{参数}：\texttt{model}（刚体系统模型），\texttt{data}（数据缓存），\texttt{q}（关节位置，维数 \texttt{model.nq}），\texttt{v}（关节速度，\texttt{model.nv}），\texttt{a}（关节加速度，\texttt{model.nv}）。
+  \item \textbf{返回}：系统关节力矩回归矩阵（即 $Y$），存储在 \texttt{data.jointTorqueRegressor}。
+  \item \textbf{动力学参数}：每个连杆 $i$ 的 $\pi_i$ 来自 \texttt{model.inertias[i].toDynamicParameters()}，通常为 10 维（质量 + 质心相关 3 维 + 惯量矩阵 6 维），具体顺序与参考系以 Pinocchio 各版本实现为准。
+\end{itemize}
+
+\subsection{为何“同一公式”会得到不同 $Y$？}
+
+式 \eqref{eq:tauYpi} 与 \eqref{eq:pi_i} 在文档层面是统一的，但 \textbf{具体实现}（即如何由 $(q,v,a)$ 和运动学/动力学中间量算出 $Y$ 的每一元素）取决于：
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Pinocchio 版本}：Pinocchio 2 与 3 在命名空间、部分算法与 API 上存在差异。官方“Porting from Pinocchio 2 to 3”\cite{pinocchio-porting23} 指出：例如 \texttt{pinocchio::regressor::computeStaticRegressor} 改为 \texttt{pinocchio::computeStaticRegressor}，以及若干与运动学、雅可比、能量等相关的函数更名或签名变更。关节力矩回归矩阵虽未在移植文档中单独列出，但若内部依赖的运动学/动力学接口或数据布局在不同版本间有变化，则同一 $(q,v,a)$ 下算出的 $Y$ 可能不同。
+  \item \textbf{编译选项与依赖}：C++ 侧通常链接系统或 CMake 找到的 Pinocchio（可能带 \texttt{PINOCCHIO\_WITHOUT\_EIGEN\_TENSOR\_SUPPORT} 等宏），Python 侧使用预编译的 wheel（如 \texttt{pip install pinocchio}），两边的 Pinocchio 版本号、补丁与编译配置可能不一致，导致实际执行的代码路径不同。
+  \item \textbf{数值实现细节}：例如参考系（连杆坐标系/世界系）、关节顺序、浮点运算顺序、是否使用 SIMD 等，都可能影响最终矩阵元素。若某一版本对 regressor 的实现有修正或优化，也会造成与另一版本的数值差异。
+\end{enumerate}
+
+因此，\textbf{“输入 $(q,\dot{q},\ddot{q})$ 一致”只能保证两边用的是同一组运动状态；回归矩阵 $Y$ 由各自 Pinocchio 库的内部实现计算，版本/构建不同即可导致 $Y$ 不同}，进而导致秩、辨识解和 RMSE 的差异。
+
+%==============================================================================
+\section{版本与 API 参考（Pinocchio 2/3）}
+%==============================================================================
+
+根据 Pinocchio 官方移植说明\cite{pinocchio-porting23}：
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{C++}：Pinocchio 3 中部分算法从子命名空间移入主命名空间，部分头文件与函数签名变更；若 C++ 工程使用 Pinocchio 2 而 Python 使用 Pinocchio 3（或反之），则两边调用的 regressor 实现可能并非同一套代码。
+  \item \textbf{Python}：Python 绑定中也有大量更名（如 \texttt{frameJacobian} $\to$ \texttt{computeFrameJacobian} 等）。若 Python 端通过 \texttt{data.joint\_torque\_regressor} 或 \texttt{data.jointTorqueRegressor} 访问结果，需与当前安装的 Pinocchio 版本文档一致，否则可能访问到不同实现或不同数据布局。
+\end{itemize}
+
+建议在对比 C++ 与 Python 时，明确记录两边的 Pinocchio 版本（例如 C++：\texttt{pkg-config --modversion pinocchio} 或 CMake 输出；Python：\texttt{pip show pinocchio}），并在文档中注明“回归矩阵差异来自 Pinocchio 版本/实现差异，而非输入数据不同”。
+
+%==============================================================================
+\section{结论与建议}
+%==============================================================================
+
+\subsection{结论}
+
+\begin{enumerate}[leftmargin=*]
+  \item 通过 \texttt{Y\_input\_cpp.csv} 与 \texttt{Y\_input\_py.csv} 的逐样本、逐列求差，可确认 C++ 与 Python 构造 $Y_{\mathrm{all}}$ 时使用的 $(q,\dot{q},\ddot{q})$ \textbf{完全一致}。
+  \item $Y_{\mathrm{all}}$ 的数值差异、秩差异以及辨识 RMSE 差异，来源于 \textbf{C++ 与 Python 所依赖的 Pinocchio 库版本或构建不同}，导致 \texttt{computeJointTorqueRegressor} 的实际实现不同，而非输入数据错误。
+  \item Pinocchio 官方文档明确给出 $\tau=Y(q,\dot{q},\ddot{q})\pi$ 及 $\pi_i=\texttt{model.inertias[i].toDynamicParameters()}$；不同版本/实现在该公式下的具体数值实现可能不同。
+\end{enumerate}
+
+\subsection{建议}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{复现与对比}：若需 C++ 与 Python 得到尽量一致的 $Y$ 与辨识结果，应尽量保证两边使用相同版本的 Pinocchio（例如都使用 2.6.x 或都使用 3.x），并统一 URDF、数据与阈值。
+  \item \textbf{工程选用}：若以辨识精度或与实验对比为准，建议以 C++ 结果（本项目中秩约 45、RMSE 约 $1.34\,\mathrm{Nm}$）为参考，或统一采用某一 Pinocchio 版本后再做对比。
+  \item \textbf{文档与引用}：在报告或论文中可引用 Pinocchio 官方文档\cite{ros-pinocchio-regressor}\cite{pinocchio-porting23}，并说明“回归矩阵由 Pinocchio 的 \texttt{computeJointTorqueRegressor} 计算；C++/Python 数值差异来自库版本与实现差异”。
+\end{itemize}
+
+%==============================================================================
+\section*{参考文献}
+%==============================================================================
+
+\begin{thebibliography}{99}
+  \bibitem{ros-pinocchio-regressor} Pinocchio 3.4.0 (ROS Humble), \textit{Template Function pinocchio::computeJointTorqueRegressor}. \\
+  \url{https://docs.ros.org/en/humble/p/pinocchio/generated/function_namespacepinocchio_1af97c3d2d695ef4636bf010c2ff6031e8.html}
+  \bibitem{pinocchio-porting23} Pinocchio, \textit{Porting from Pinocchio 2 to 3}. \\
+  \url{https://gepettoweb.laas.fr/doc/stack-of-tasks/pinocchio/master/doxygen-html/md_doc__porting.html}
+  \bibitem{pinocchio-dynamic} Pinocchio, \textit{Inverse dynamics / Dynamic documentation}. \\
+  \url{https://docs.ros.org/en/jazzy/p/pinocchio/doc/a-features/g-dynamic.html}
+  \bibitem{pinocchio-regressor-cpp} Pinocchio, \textit{regressor.cpp File Reference}. \\
+  \url{https://docs.ros.org/en/api/pinocchio/html/src_2algorithm_2regressor_8cpp.html}
+\end{thebibliography}
+
+\end{document}

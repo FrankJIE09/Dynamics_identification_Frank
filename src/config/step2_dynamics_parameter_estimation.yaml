@@ -1,0 +1,28 @@
+# Step2 动力学参数辨识配置
+# 程序从当前目录 config/ 或可执行文件所在目录 config/ 读取；未找到则使用代码内默认值
+# 命令行 argv[1] 覆盖 data_file，argv[2] 覆盖 urdf_file
+
+# 输入：采集数据 CSV（从 build 运行时用 config/dynamics_identification_data.csv）
+data_file: config/dynamics_identification_data.csv
+# 输入：URDF 路径（用于回归矩阵与先验）
+urdf: urdf/AR5-5_07R-W4C4A2_Manual_fix.urdf
+
+# Ridge 正则化：lambda = lambda_rel * trace(Y'*Y)/n_params，越大越贴近 URDF 先验
+lambda_rel: 1
+# 质量下界 (kg)：投影时 theta[10*j] >= m_min
+m_min: 0.0001
+# 惯性特征值下界：投影时 I 特征值 >= I_eps
+I_eps: 1.0e-6
+# 投影后 trace(I) < I_trace_min 时用 URDF 先验替代该连杆（避免 1e-6 级惯量写回 URDF）
+I_trace_min: 0.000000000001
+
+# 输出目录（空则写入当前工作目录；Python 默认 build_outputs）
+output_dir: build_outputs
+# 输出文件（相对 output_dir 或当前工作目录）
+result_file: dynamics_identification_results.txt
+dynamics_parameters_csv: dynamics_parameters.csv
+dynamics_parameters_ls_csv: dynamics_parameters_ls.csv
+dynamics_parameters_urdf_csv: dynamics_parameters_urdf.csv
+dynamics_physical_parameters_txt: dynamics_physical_parameters_identified.txt
+output_urdf: AR5-5_07R-W4C4A2_identified_inertia_com.urdf
+output_urdf_joint: AR5-5_07R-W4C4A2_identified_inertia_joint_origin.urdf

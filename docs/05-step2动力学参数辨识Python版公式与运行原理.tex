@@ -1,0 +1,334 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{bm}
+\usepackage{booktabs}
+
+\geometry{margin=2.5cm}
+
+\title{step2 动力学参数辨识（Python 版）\\运行原理与计算公式}
+\author{Dynamics\_identification\_Frank}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本文针对 \texttt{scripts/step2\_dynamics\_parameter\_estimation.py} 的运行原理进行说明，重点给出各步骤对应的数学公式：动力学线性回归形式、回归矩阵与数据堆叠、最小二乘（SVD）、Ridge 回归、带质量约束的 QP 求解、物理可行域投影，以及误差与验证指标。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{动力学线性回归模型}
+%==============================================================================
+
+\subsection{关节力矩与动力学参数}
+
+机器人刚体动力学可写成关于动力学参数的线性形式：
+\begin{equation}
+  \bm{\tau} = Y(\bm{q},\dot{\bm{q}},\ddot{\bm{q}})\,\bm{\pi},
+  \label{eq:tau_Y_pi}
+\end{equation}
+其中
+\begin{itemize}[leftmargin=*]
+  \item $\bm{\tau}\in\mathbb{R}^{n_q}$：关节力矩（$n_q=7$）；
+  \item $\bm{q},\dot{\bm{q}},\ddot{\bm{q}}$：关节位置、速度、加速度；
+  \item $Y\in\mathbb{R}^{n_q\times n_{\mathrm{params}}}$：关节力矩回归矩阵，由 Pinocchio 的 \texttt{computeJointTorqueRegressor} 计算；
+  \item $\bm{\pi}\in\mathbb{R}^{n_{\mathrm{params}}}$：全机动力学参数向量（本程序中 $n_{\mathrm{params}}=70$，即 7 个连杆 $\times$ 每连杆 10 维）。
+\end{itemize}
+
+\subsection{单连杆 10 维参数}
+
+每个连杆 $j$ 对应 10 个动力学参数（质心处惯量约定，与文档 03 一致）：
+\begin{equation}
+  \bm{\pi}_j = \bigl[\, m_j,\; m_j c_x,\; m_j c_y,\; m_j c_z,\; I_{xx},\; I_{xy},\; I_{yy},\; I_{xz},\; I_{yz},\; I_{zz} \,\bigr]^\top \in \mathbb{R}^{10}.
+  \label{eq:pi_10}
+\end{equation}
+其中 $m_j$ 为质量，$(c_x,c_y,c_z)$ 为质心在连杆坐标系下的坐标，后 6 项为质心处惯性张量 $I_C$ 的独立分量（\texttt{ixx, ixy, iyy, ixz, iyz, izz}）。全机参数为
+\[
+\bm{\pi} = [\bm{\pi}_1^\top,\, \bm{\pi}_2^\top,\, \ldots,\, \bm{\pi}_{n_{\mathrm{links}}}^\top]^\top.
+\]
+
+%==============================================================================
+\section{数据与回归矩阵的堆叠}
+%==============================================================================
+
+\subsection{单样本数据}
+
+CSV 每行一个采样点，列顺序为：
+\[
+\texttt{timestamp},\; q_1,\ldots,q_7,\; \dot{q}_1,\ldots,\dot{q}_7,\; \ddot{q}_1,\ldots,\ddot{q}_7,\; \tau_1,\ldots,\tau_7.
+\]
+对第 $i$ 个样本，给定 $(\bm{q}^{(i)},\dot{\bm{q}}^{(i)},\ddot{\bm{q}}^{(i)})$，调用 Pinocchio 得到该时刻的回归矩阵 $Y^{(i)}\in\mathbb{R}^{7\times 70}$ 与测量力矩 $\bm{\tau}^{(i)}\in\mathbb{R}^7$，满足
+\[
+\bm{\tau}^{(i)} = Y^{(i)}\,\bm{\pi}.
+\]
+
+\subsection{堆叠形式}
+
+设共有 $N$ 个样本。将各样本的 $Y^{(i)}$ 按行堆叠为 $Y_{\mathrm{all}}$，将 $\bm{\tau}^{(i)}$ 按顺序拼接为 $\bm{\tau}_{\mathrm{all}}$：
+\begin{equation}
+  Y_{\mathrm{all}} =
+  \begin{bmatrix} Y^{(1)} \\ Y^{(2)} \\ \vdots \\ Y^{(N)} \end{bmatrix}
+  \in \mathbb{R}^{(7N)\times 70},\qquad
+  \bm{\tau}_{\mathrm{all}} =
+  \begin{bmatrix} \bm{\tau}^{(1)} \\ \bm{\tau}^{(2)} \\ \vdots \\ \bm{\tau}^{(N)} \end{bmatrix}
+  \in \mathbb{R}^{7N}.
+  \label{eq:Y_tau_stack}
+\end{equation}
+则全数据下的线性方程为
+\begin{equation}
+  Y_{\mathrm{all}}\,\bm{\theta} = \bm{\tau}_{\mathrm{all}},
+  \label{eq:Y_theta_tau}
+\end{equation}
+其中 $\bm{\theta}$ 为待辨识的 70 维参数向量（与 $\bm{\pi}$ 同义）。
+
+%==============================================================================
+\section{最小二乘解（SVD 伪逆）}
+%==============================================================================
+
+\subsection{秩与奇异值}
+
+对 $Y_{\mathrm{all}}$ 做奇异值分解：
+\begin{equation}
+  Y_{\mathrm{all}} = U\,S\,V^\top,\quad
+  S = \mathrm{diag}(s_1,s_2,\ldots,s_{70}),\quad s_1\ge s_2\ge \cdots \ge 0.
+  \label{eq:svd}
+\end{equation}
+秩的估计：给定阈值 $\epsilon = 10^{-6}\cdot s_1$，
+\[
+\mathrm{rank}(Y_{\mathrm{all}}) = \#\{i : s_i > \epsilon\}.
+\]
+若秩 $<70$，则回归矩阵不满秩，部分参数不可单独辨识。
+
+\subsection{伪逆解}
+
+最小二乘解（无正则、无约束）为
+\begin{equation}
+  \bm{\theta}_{\mathrm{ls}} = Y_{\mathrm{all}}^+ \,\bm{\tau}_{\mathrm{all}}
+  = V\,\bigl(S^+ U^\top \bm{\tau}_{\mathrm{all}}\bigr),
+  \label{eq:theta_ls}
+\end{equation}
+其中 $S^+$ 为 $S$ 的伪逆：对角元为 $1/s_i$（若 $s_i>10^{-12}$），否则取 $1/10^{-12}$ 避免除零。即
+\[
+\theta_{\mathrm{ls}} = V^\top \,\bigl( (1/s_i)_{i} \odot (U^\top \bm{\tau}_{\mathrm{all}}) \bigr).
+\]
+代码中对应：\texttt{theta\_ls = (Vt.T * (1.0 / np.where(s > 1e-12, s, 1e-12))) @ (U.T @ tau\_all)}。
+
+%==============================================================================
+\section{Ridge 回归（URDF 先验）}
+%==============================================================================
+
+\subsection{正则化与先验}
+
+引入 URDF 先验 $\bm{\theta}_{\mathrm{urdf}}$ 与正则系数 $\lambda$，Ridge 问题为
+\begin{equation}
+  \min_{\bm{\theta}} \;
+  \bigl\| Y_{\mathrm{all}}\bm{\theta} - \bm{\tau}_{\mathrm{all}} \bigr\|^2
+  + \lambda\,\bigl\| \bm{\theta} - \bm{\theta}_{\mathrm{urdf}} \bigr\|^2.
+  \label{eq:ridge_obj}
+\end{equation}
+
+\subsection{正则系数}
+
+程序中 $\lambda$ 由相对系数 \texttt{lambda\_rel} 与数据尺度确定：
+\begin{equation}
+  \lambda = \lambda_{\mathrm{rel}} \cdot \frac{\mathrm{tr}(Y_{\mathrm{all}}^\top Y_{\mathrm{all}})}{n_{\mathrm{params}}}.
+  \label{eq:lambda}
+\end{equation}
+默认 $\lambda_{\mathrm{rel}}=10^{-3}$。
+
+\subsection{正规方程与解}
+
+式 \eqref{eq:ridge_obj} 对 $\bm{\theta}$ 求导并令其为零，得
+\begin{equation}
+  \bigl( Y_{\mathrm{all}}^\top Y_{\mathrm{all}} + \lambda I \bigr)\,\bm{\theta}
+  = Y_{\mathrm{all}}^\top \bm{\tau}_{\mathrm{all}} + \lambda\,\bm{\theta}_{\mathrm{urdf}}.
+  \label{eq:ridge_normal}
+\end{equation}
+记
+\[
+A = Y_{\mathrm{all}}^\top Y_{\mathrm{all}} + \lambda I,\qquad
+\bm{b} = Y_{\mathrm{all}}^\top \bm{\tau}_{\mathrm{all}} + \lambda\,\bm{\theta}_{\mathrm{urdf}},
+\]
+则
+\begin{equation}
+  \bm{\theta}_{\mathrm{ridge}} = A^{-1}\bm{b}.
+  \label{eq:theta_ridge}
+\end{equation}
+代码中通过 \texttt{np.linalg.solve(A, b)} 求解。
+
+%==============================================================================
+\section{带质量约束的 QP 求解（OSQP）}
+%==============================================================================
+
+\subsection{二次型与线性项}
+
+将 Ridge 目标改写为标准 QP 形式：
+\begin{equation}
+  \min_{\bm{\theta}} \;\; \frac{1}{2}\,\bm{\theta}^\top H\,\bm{\theta} + \bm{g}^\top\bm{\theta},
+  \label{eq:qp_obj}
+\end{equation}
+其中
+\begin{align}
+  H &= 2\,Y_{\mathrm{all}}^\top Y_{\mathrm{all}} + 2\lambda\,I
+  \quad \text{（对角元为 } (Y^\top Y)_{ii} + 2\lambda \text{）}, \\
+  \bm{g} &= -2\,\bigl( Y_{\mathrm{all}}^\top \bm{\tau}_{\mathrm{all}} + \lambda\,\bm{\theta}_{\mathrm{urdf}} \bigr).
+  \label{eq:H_g}
+\end{align}
+代码实现：\texttt{H = 2.0 * (Y\_all.T @ Y\_all)}，再 \texttt{H.flat[::n+1] += 2.0*lam}；\texttt{g = -2.0 * (Y\_all.T @ tau\_all + lam * theta\_urdf)}。
+
+\subsection{质量约束}
+
+每连杆质量对应 $\bm{\theta}$ 中下标 $10j$ 的分量（$j=0,\ldots,n_{\mathrm{links}}-1$），约束为
+\begin{equation}
+  \theta_{10j} \ge m_{\min},\qquad j=0,1,\ldots,n_{\mathrm{links}}-1.
+  \label{eq:mass_constraint}
+\end{equation}
+写成 $A\bm{\theta}\le \bm{u}$ 形式：定义 $A\in\mathbb{R}^{n_{\mathrm{links}}\times n_{\mathrm{params}}}$，第 $j$ 行仅在列 $10j$ 处为 $-1$，其余为 0，则
+\[
+-\theta_{10j} \le -m_{\min} \;\Leftrightarrow\; (A\bm{\theta})_j \le -m_{\min}.
+\]
+OSQP 中设 $l_j=-\infty$，$u_j=-m_{\min}$，即得式 \eqref{eq:mass_constraint}。
+
+\subsection{求解}
+
+使用 OSQP 求解式 \eqref{eq:qp_obj} 与质量约束，得到 $\bm{\theta}_{\mathrm{qp}}$。若求解失败则回退到 Ridge 解 \eqref{eq:theta_ridge}。
+
+%==============================================================================
+\section{物理可行域投影}
+%==============================================================================
+
+对求得的 $\bm{\theta}$（或 $\bm{\theta}_{\mathrm{qp}}$）按连杆进行物理投影，保证质量与惯量可行。
+
+\subsection{单连杆 10 维到 Inertia}
+
+对连杆 $j$，取 $\bm{\pi}_j = \bm{\theta}[10j:10j+10]$，由 Pinocchio 转为惯性对象：
+\[
+(m,\, \bm{c},\, I) \leftarrow \texttt{Inertia.FromDynamicParameters}(\bm{\pi}_j).
+\]
+其中 $I$ 为连杆原点处惯性张量 $I_{\mathrm{origin}}$（对称 $3\times 3$）。
+
+\subsection{质量下界}
+
+\begin{equation}
+  m \leftarrow \max(m,\, m_{\min}).
+  \label{eq:m_min}
+\end{equation}
+
+\subsection{惯量对称与正定性}
+
+\begin{enumerate}[leftmargin=*]
+  \item 对称化：$I \leftarrow (I+I^\top)/2$。
+  \item 特征值分解：$I = Q\,\Lambda\,Q^\top$，$\Lambda=\mathrm{diag}(\lambda_1,\lambda_2,\lambda_3)$，$\lambda_1\le\lambda_2\le\lambda_3$。
+  \item 特征值下界：$\lambda_i \leftarrow \max(\lambda_i,\, I_{\epsilon})$。
+  \item 三角不等式（转动惯量物理可行）：满足 $\lambda_3 \le \lambda_1+\lambda_2$，否则取
+  \begin{equation}
+    \lambda_3 \leftarrow \min\bigl(\lambda_3,\, \lambda_1 + \lambda_2 - I_{\epsilon}\bigr),\qquad
+    \lambda_3 \leftarrow \max(\lambda_3,\, I_{\epsilon}).
+  \label{eq:triangle}
+  \end{equation}
+  \item 重构：$I \leftarrow Q\,\Lambda\,Q^\top$。
+\end{enumerate}
+
+\subsection{trace 过小回退}
+
+若 $\mathrm{tr}(I) < I_{\mathrm{trace\_min}}$，且提供了 URDF 先验 $\bm{\theta}_{\mathrm{urdf}}$，则该连杆的 10 维参数用先验替代：
+\[
+\bm{\theta}[10j:10j+10] \leftarrow \bm{\theta}_{\mathrm{urdf}}[10j:10j+10].
+\]
+否则用投影后的 $(m,\bm{c},I)$ 再转回 10 维写回 $\bm{\theta}$（\texttt{inv\_proj.toDynamicParameters()}）。
+
+%==============================================================================
+\section{重力设置}
+%==============================================================================
+
+与 C++ 一致，基座到世界的旋转取为 $R_{\mathrm{base}} = R_z(-\pi/2)\,R_y(\pi/2)$：
+\begin{equation}
+  R_y = \begin{bmatrix} 0&0&1 \\ 0&1&0 \\ -1&0&0 \end{bmatrix},\quad
+  R_z = \begin{bmatrix} 0&-1&0 \\ 1&0&0 \\ 0&0&1 \end{bmatrix},\quad
+  \bm{g}_{\mathrm{world}} = \begin{bmatrix} 0\\0\\-9.81 \end{bmatrix},\quad
+  \bm{g}_{\mathrm{base}} = R_{\mathrm{base}}^\top \bm{g}_{\mathrm{world}}.
+  \label{eq:gravity}
+\end{equation}
+模型中的重力设为 $\bm{g}_{\mathrm{base}}$，供 Pinocchio 计算回归矩阵与 RNEA。
+
+%==============================================================================
+\section{误差与验证指标}
+%==============================================================================
+
+\subsection{训练误差}
+
+预测力矩与测量力矩的误差向量为
+\[
+\bm{e} = \bm{\tau}_{\mathrm{all}} - Y_{\mathrm{all}}\,\bm{\theta}_{\mathrm{est}}.
+\]
+定义
+\begin{align}
+  \mathrm{RMSE} &= \sqrt{\frac{1}{n_e}\sum_{k=1}^{n_e} e_k^2}, &
+  n_e &= 7N; \\
+  \mathrm{MaxError} &= \max_k |e_k|; \\
+  \mathrm{MeanAbsError} &= \frac{1}{n_e}\sum_{k=1}^{n_e} |e_k|.
+\end{align}
+
+\subsection{验证集}
+
+取后 20\% 样本作为验证集，用同一 $\bm{\theta}_{\mathrm{est}}$ 计算 $Y_{\mathrm{val}}\,\bm{\theta}_{\mathrm{est}}$，与测量 $\bm{\tau}_{\mathrm{val}}$ 比较，得到验证集 RMSE。并可用原 URDF 与辨识后的 URDF 分别做 RNEA 预测，与测量力矩比较 RMSE 与最大绝对误差。
+
+%==============================================================================
+\section{输出与 URDF 生成}
+%==============================================================================
+
+\subsection{参数与物理量}
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{dynamics\_parameters\_csv}：最终 $\bm{\theta}_{\mathrm{est}}$（含 QP/投影后）。
+  \item \texttt{dynamics\_parameters\_ls\_csv}：Ridge 解 $\bm{\theta}_{\mathrm{ridge}}$（未做 QP 与投影）。
+  \item \texttt{dynamics\_parameters\_urdf\_csv}：URDF 先验 $\bm{\theta}_{\mathrm{urdf}}$。
+\end{itemize}
+质心与惯量由 $\bm{\theta}_{\mathrm{est}}$ 按式 \eqref{eq:pi_10} 解析：$m=\pi_0$，$\bm{c}=(\pi_1,\pi_2,\pi_3)^\top/m$，质心处惯量 $I_C$ 的 6 个分量为 $\pi_4,\ldots,\pi_9$。
+
+\subsection{两种 URDF}
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{质心处惯量}：\texttt{<inertia>} 为 $I_C$，\texttt{<origin xyz>} 为质心 $\bm{c}$。
+  \item \textbf{关节原点惯量}：\texttt{<inertia>} 为 $I_{\mathrm{origin}}$（由 Pinocchio 的 \texttt{inv\_id.inertia()}），\texttt{<origin xyz>} 仍为质心。与文档 03 中平行轴定理一致。
+\end{enumerate}
+
+%==============================================================================
+\section{公式汇总表}
+%==============================================================================
+
+\begin{table}[h]
+\centering
+\caption{主要公式与代码对应}
+\begin{tabular}{ll}
+\toprule
+\textbf{内容} & \textbf{公式/说明} \\
+\midrule
+动力学回归 & $\bm{\tau}=Y(\bm{q},\dot{\bm{q}},\ddot{\bm{q}})\bm{\pi}$ \\
+10 维参数 & $\bm{\pi}_j=[m,mc_x,mc_y,mc_z,I_{xx},I_{xy},I_{yy},I_{xz},I_{yz},I_{zz}]^\top$ \\
+堆叠方程 & $Y_{\mathrm{all}}\bm{\theta}=\bm{\tau}_{\mathrm{all}}$ \\
+SVD 秩 & $\mathrm{rank}=\#\{i:s_i>10^{-6}s_1\}$ \\
+伪逆解 & $\bm{\theta}_{\mathrm{ls}}=V S^+ U^\top \bm{\tau}_{\mathrm{all}}$ \\
+$\lambda$ & $\lambda=\lambda_{\mathrm{rel}}\,\mathrm{tr}(Y^\top Y)/n_{\mathrm{params}}$ \\
+Ridge 解 & $(Y^\top Y+\lambda I)\bm{\theta}=Y^\top\bm{\tau}+\lambda\bm{\theta}_{\mathrm{urdf}}$ \\
+QP：$H$ & $H=2Y^\top Y+2\lambda I$ \\
+QP：$\bm{g}$ & $\bm{g}=-2(Y^\top\bm{\tau}+\lambda\bm{\theta}_{\mathrm{urdf}})$ \\
+质量约束 & $\theta_{10j}\ge m_{\min}$ \\
+质量投影 & $m\leftarrow\max(m,m_{\min})$ \\
+惯量特征值 & $\lambda_i\leftarrow\max(\lambda_i,I_{\epsilon})$；三角不等式 $\lambda_3\le\lambda_1+\lambda_2$ \\
+RMSE & $\sqrt{\mathrm{mean}(\bm{e}^2)}$，$\bm{e}=\bm{\tau}_{\mathrm{all}}-Y_{\mathrm{all}}\bm{\theta}$ \\
+\bottomrule
+\end{tabular}
+\label{tab:formulas}
+\end{table}
+
+\end{document}

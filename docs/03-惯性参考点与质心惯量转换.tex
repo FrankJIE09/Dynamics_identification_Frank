@@ -1,0 +1,201 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{bm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+
+\geometry{margin=2.5cm}
+
+\title{惯性参考点与质心惯量：代码中的转换关系}
+\author{Dynamics\_identification\_Frank}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本文详细说明 \texttt{step2\_dynamics\_parameter\_estimation.cpp} 中“连杆原点处转动惯量”$I_{\mathrm{origin}}$ 与“质心处转动惯量”$I_C$ 的区分与转换。程序与 Pinocchio、URDF、10 维动力学参数之间的约定一致：对外（CSV、URDF 文件、报告）统一使用质心处惯量；Pinocchio 内部及物理投影的中间步骤使用连杆原点处惯量，并通过平行轴定理正确转换。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{概念与公式}
+%==============================================================================
+
+\subsection{两个参考点}
+
+对每个连杆，惯性张量依赖于参考点与坐标系：
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{连杆原点（参考点）}：连杆坐标系原点，即 Pinocchio 中该 body 的附着点。记该点处的 $3\times 3$ 惯性张量为 $I_{\mathrm{origin}}$。
+  \item \textbf{质心}：质心在连杆坐标系下的位置为 $\bm{c}=(c_x,c_y,c_z)^\top$。记质心处的惯性张量为 $I_C$。
+\end{itemize}
+
+\subsection{平行轴定理}
+
+两者满足（Pinocchio 与多数动力学库采用此约定）：
+\begin{equation}
+  I_{\mathrm{origin}} = I_C + m\,S(\bm{c})^\top S(\bm{c})
+  \label{eq:parallel}
+\end{equation}
+其中 $S(\bm{c})$ 为 $\bm{c}$ 的叉积反对称矩阵：$S(\bm{c})\bm{v}=\bm{c}\times\bm{v}$。因此
+\begin{equation}
+  I_C = I_{\mathrm{origin}} - m\,S(\bm{c})^\top S(\bm{c}).
+  \label{eq:origin_to_com}
+\end{equation}
+
+在 Pinocchio 源码中，$m\,S^\top S$ 对应 \texttt{AlphaSkewSquare(mass(), lever())}（\texttt{pinocchio/spatial/symmetric3.hpp}）。
+
+\subsection{10 维动力学参数与 URDF 约定}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{10 维向量}（每连杆）：
+    \[
+    \bm{\pi} = [m,\; mc_x,\; mc_y,\; mc_z,\; I_{xx},\; I_{xy},\; I_{yy},\; I_{xz},\; I_{yz},\; I_{zz}]^\top.
+    \]
+    其中后 6 个为 \textbf{质心处}惯性 $I_C$ 的 6 个独立分量（顺序与 Pinocchio 的 \texttt{Symmetric3} 一致：Ixx, Ixy, Iyy, Ixz, Iyz, Izz）。
+  \item \textbf{URDF}：\texttt{<inertial>} 中 \texttt{<origin xyz="cx cy cz"/>} 表示质心位置，\texttt{<inertia ixx=.../>} 表示 \textbf{质心处}惯性 $I_C$（与 10 维一致）。
+  \item \textbf{Pinocchio 内部}：\texttt{Inertia} 对象存储的是连杆原点处的空间惯性；\texttt{inertia()} 返回 $I_{\mathrm{origin}}$（$3\times 3$），\texttt{lever()} 返回 $\bm{c}$。
+\end{itemize}
+
+因此：CSV、URDF 文件、10 维参数中的“惯性”均为 $I_C$；Pinocchio 的 \texttt{model.inertias[jid].inertia()} 为 $I_{\mathrm{origin}}$。代码必须在读写 URDF 与 10 维时使用 $I_C$，在调用 Pinocchio 的 \texttt{FromDynamicParameters}/\texttt{toDynamicParameters} 时理解其输入输出分别为 $I_C$ 与 $I_{\mathrm{origin}}$ 的转换。
+
+%==============================================================================
+\section{代码中的数据流与转换位置}
+%==============================================================================
+
+\subsection{总览}
+
+图~\ref{fig:flow} 概括了惯性在程序中的流向。下面对每条路径给出对应代码位置与公式。
+
+\begin{figure}[h]
+  \centering
+  \fbox{\parbox{0.85\textwidth}{
+    \textbf{URDF 文件}（$I_C$）\\
+    $\downarrow$ \texttt{buildModel} \\
+    \textbf{Pinocchio 内部}（$I_{\mathrm{origin}}$）\\
+    $\downarrow$ \texttt{toDynamicParameters()}，式\eqref{eq:origin_to_com} \\
+    \textbf{theta\_urdf / CSV}（10 维，$I_C$ 在 $\pi[4{:}9]$）\\
+    $\downarrow$ Ridge/QP，投影 \texttt{projectThetaToPhysical}（见正文）\\
+    \textbf{theta\_estimated}（10 维，$I_C$）\\
+    $\downarrow$ 写 URDF 时直接用 $\pi[4{:}9]$；写报告时用 $\pi[4{:}9]$ 或 $I_{\mathrm{origin}}-m S^T S$\\
+    \textbf{输出 URDF / dynamics\_physical\_parameters\_identified.txt}（$I_C$）
+  }}
+  \caption{惯性在程序中的表示与转换}
+  \label{fig:flow}
+\end{figure}
+
+%------------------------------------------------------------------------------
+\subsection{URDF $\to$ 10 维（theta\_urdf）}
+%------------------------------------------------------------------------------
+
+\textbf{位置}：约 568--584 行。
+
+从 URDF 加载模型后，对每个关节 \texttt{jid} 调用 \texttt{pinocchio\_model.inertias[jid].toDynamicParameters()} 得到 10 维并写入 \texttt{theta\_urdf}。Pinocchio 源码（\texttt{inertia.hpp}）中：
+\begin{lstlisting}[language=C++,basicstyle=\ttfamily\small]
+v.segment<6>(4) = (inertia() - AlphaSkewSquare(mass(), lever())).data();
+\end{lstlisting}
+即 $v_{4:9}$ 来自 $I_{\mathrm{origin}} - m\,S^\top S = I_C$。因此 \textbf{theta\_urdf 中每连杆后 6 个参数已是质心处惯量}，无需在本仓库中再做平行轴换算。
+
+%------------------------------------------------------------------------------
+\subsection{10 维 $\to$ 写回 URDF（generateIdentifiedURDF）}
+%------------------------------------------------------------------------------
+
+\textbf{位置}：约 149--176 行。
+
+程序将辨识得到的 \texttt{theta\_estimated} 写回 URDF。URDF 的 \texttt{<inertia>} 必须为质心处 $I_C$。若错误地使用 \texttt{inertia\_id.inertia()}（即 \texttt{FromDynamicParameters(pi\_id)} 后得到的 $I_{\mathrm{origin}}$），会与 URDF 语义不符。代码中已改为直接使用 10 维的后 6 个分量：
+
+\begin{lstlisting}[language=C++,basicstyle=\ttfamily\small]
+// URDF 约定：<inertia> 为质心处惯性 I_C；10 维中 pi_id[4..9] 即为 I_C
+const double ixx = pi_id(4), ixy = pi_id(5), iyy = pi_id(6),
+             ixz = pi_id(7), iyz = pi_id(8), izz = pi_id(9);
+// 写入 <inertia ixx=... ixy=... ixz=... iyy=... iyz=... izz=... />
+\end{lstlisting}
+
+质量与质心仍由 \texttt{inertia\_id.mass()}、\texttt{inertia\_id.lever()} 得到（与 $\pi[0],\pi[1{:}3]/m$ 一致）。这样 \textbf{从 10 维到 URDF 的转换仅做取数与顺序映射，不涉及平行轴}，且与 URDF 约定一致。
+
+%------------------------------------------------------------------------------
+\subsection{物理投影 projectThetaToPhysical 中的惯量}
+%------------------------------------------------------------------------------
+
+\textbf{位置}：约 273--337 行。
+
+输入 \texttt{theta} 的每块 10 维中，$\pi[4{:}9]$ 为 $I_C$。流程为：
+
+\begin{enumerate}[leftmargin=*]
+  \item \texttt{FromDynamicParameters(pi)} 得到 \texttt{inv}。Pinocchio 内部存的是 $I_{\mathrm{origin}} = I_C + m\,S^\top S$，故 \texttt{inv.inertia()} 为 $I_{\mathrm{origin}}$。
+  \item 代码对 \texttt{I = inv.inertia()}（即 $I_{\mathrm{origin}}$）做对称化、特征值下界、三角不等式等投影，得到 $I_{\mathrm{origin}}^{\mathrm{proj}}$。
+  \item \texttt{inv\_proj(m, c, I\_origin\_proj)} 构造投影后的 Inertia，再 \texttt{pi\_new = inv\_proj.toDynamicParameters()}。Pinocchio 的 \texttt{toDynamicParameters()} 会计算 $I_C^{\mathrm{proj}} = I_{\mathrm{origin}}^{\mathrm{proj}} - m\,S^\top S$ 并填入返回向量的 $[4{:}9]$。
+  \item \texttt{theta.segment(base, 10) = pi\_new} 将投影后的 \textbf{质心处惯量} 写回 10 维。
+\end{enumerate}
+
+因此：\textbf{投影在连杆原点惯量 $I_{\mathrm{origin}}$ 上进行，写回 theta 时通过 \texttt{toDynamicParameters()} 正确转回质心惯量 $I_C$}，转换关系由 Pinocchio 保证。
+
+%------------------------------------------------------------------------------
+\subsection{运行前打印：URDF 原始 vs 转换后 10 维}
+%------------------------------------------------------------------------------
+
+\textbf{位置}：约 586--618 行。
+
+为便于核对，程序对每个连杆打印：
+\begin{itemize}[leftmargin=*]
+  \item \textbf{I\_origin（连杆原点）}：\texttt{inv.inertia().matrix()}，即 $I_{\mathrm{origin}}$；
+  \item \textbf{I\_at\_COM（质心处）}：\texttt{inv.inertia() - AlphaSkewSquare(m\_urdf, c\_urdf)}，即 $I_C$，与 \texttt{theta\_urdf} 的 $\pi[4{:}9]$ 一致；
+  \item \textbf{转换后 10 维}：\texttt{theta\_urdf} 的对应 10 个数。
+\end{itemize}
+
+注释中已说明：\texttt{inertia()} 为连杆原点惯性，\texttt{toDynamicParameters()} 中 I6 为质心处惯性，二者差平行轴项，数值不同属正常。
+
+%------------------------------------------------------------------------------
+\subsection{辨识结果报告 dynamics\_physical\_parameters\_identified.txt}
+%------------------------------------------------------------------------------
+
+\textbf{位置}：约 918--955 行。
+
+报告中“URDF 惯性”与“辨识 惯性”均统一为 \textbf{质心处}，以便与 10 维及输出 URDF 一致：
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{URDF 惯性（质心处）}：由 \texttt{pinocchio\_model.inertias[jid].inertia() - AlphaSkewSquare(m\_urdf, c\_urdf)} 得到 $I_C$ 再打印为 $3\times 3$。
+  \item \textbf{辨识 惯性（质心处）}：由 \texttt{pi\_id(4)...pi\_id(9)} 按 Symmetric3 顺序拼成 $3\times 3$ 再打印（不调用 \texttt{inertia\_id.inertia()}）。
+\end{itemize}
+
+说明第 5 条注明：“以下惯性均为质心处惯性(与 URDF \texttt{<inertia>} 及 10 维参数一致)”。
+
+%==============================================================================
+\section{小结：何处为原点惯量、何处为质心惯量}
+%==============================================================================
+
+表~\ref{tab:summary} 汇总代码与数据中惯量的参考点。
+
+\begin{table}[htbp]
+  \centering
+  \caption{惯性参考点在程序中的使用}
+  \label{tab:summary}
+  \begin{tabular}{llp{5.5cm}}
+    \toprule
+    位置 & 参考点 & 说明 \\
+    \midrule
+    10 维 $\theta$、CSV 后 6 列 & 质心 $I_C$ & 回归变量、Ridge/QP 解、投影后的 \texttt{theta\_estimated} \\
+    URDF \texttt{<inertia>}（读/写） & 质心 $I_C$ & 约定；写出时用 \texttt{pi\_id(4:9)} \\
+    \texttt{toDynamicParameters()} 返回值 $[4{:}9]$ & 质心 $I_C$ & Pinocchio 内部由 $I_{\mathrm{origin}}-m S^T S$ 得到 \\
+    \texttt{model.inertias[jid].inertia()} & 原点 $I_{\mathrm{origin}}$ & Pinocchio 内部存储 \\
+    \texttt{FromDynamicParameters(pi).inertia()} & 原点 $I_{\mathrm{origin}}$ & $I_C + m S^T S$ \\
+    \texttt{projectThetaToPhysical} 中投影对象 & 原点 $I_{\mathrm{origin}}$ & 对 \texttt{inv.inertia()} 投影；写回时经 \texttt{toDynamicParameters()} 转成 $I_C$ \\
+    运行前打印 “I\_origin” & 原点 $I_{\mathrm{origin}}$ & \texttt{inv.inertia().matrix()} \\
+    运行前打印 “I\_at\_COM” / 报告中的惯性 & 质心 $I_C$ & 与 10 维、URDF 一致 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{结论}：程序正确区分并处理了“连杆原点处转动惯量”与“质心处转动惯量”的转换。所有对外输出（CSV、URDF、物理参数报告）均为质心处 $I_C$；仅在 Pinocchio 内部及物理投影的中间步骤使用 $I_{\mathrm{origin}}$，并通过 \texttt{toDynamicParameters()} 或显式减去 \texttt{AlphaSkewSquare} 正确转回 $I_C$。
+
+\end{document}

@@ -1,0 +1,6 @@
+# Step2 动力学参数辨识 (Python) 依赖
+# 若使用 ROS 自带的 pinocchio：需 numpy<2，且不必安装 pin；先 source /opt/ros/humble/setup.bash
+# 若使用 pip/conda 的 Pinocchio：pip install pin 或 conda install -c conda-forge pinocchio
+numpy>=1.20
+PyYAML>=5.1
+osqp>=0.6  # 可选：用于带质量约束的 QP 求解

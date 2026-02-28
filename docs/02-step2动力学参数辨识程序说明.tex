@@ -1,0 +1,195 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{bm}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\geometry{margin=2.5cm}
+
+\title{step2\_dynamics\_parameter\_estimation 程序运行说明}
+\author{Dynamics\_identification\_Frank}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本文详细说明 \texttt{step2\_dynamics\_parameter\_estimation.cpp} 的运行流程，包括配置加载、数据与 URDF 读入、回归矩阵构造、Ridge/QP 求解、物理约束投影及各类输出文件的含义。重点说明 \texttt{dynamics\_parameters\_urdf.csv} 的来源与生成方式。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{程序入口与配置加载}
+%==============================================================================
+
+\subsection{main 函数流程（约 1033--1081 行）}
+
+程序从 \texttt{main} 进入后依次执行：
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{查找配置文件}：依次尝试
+    \begin{itemize}
+      \item \texttt{config/step2\_dynamics\_parameter\_estimation.yaml}（相对当前工作目录）
+      \item \texttt{src/config/step2\_dynamics\_parameter\_estimation.yaml}
+      \item \texttt{<可执行文件所在目录>/config/step2\_dynamics\_parameter\_estimation.yaml}
+    \end{itemize}
+    找到第一个存在的路径即停止。
+  \item \textbf{加载配置}：调用 \texttt{loadStep2Config(config\_path)}，按行解析 YAML（\texttt{key: value}，忽略 \texttt{\#} 注释），填充 \texttt{Step2Config} 结构体，得到数据文件路径、URDF 路径、\texttt{lambda\_rel}、\texttt{m\_min}、\texttt{I\_eps}、\texttt{I\_trace\_min} 以及各输出文件名（含 \texttt{dynamics\_parameters\_urdf\_csv}）。
+  \item \textbf{命令行覆盖}：若 \texttt{argc>1}，用 \texttt{argv[1]} 覆盖配置中的 \texttt{data\_file}；若 \texttt{argc>2}，用 \texttt{argv[2]} 覆盖 \texttt{urdf\_file}。
+  \item \textbf{调用辨识主函数}：\texttt{estimateDynamicsParameters(data\_file, urdf\_file, cfg)}。
+\end{enumerate}
+
+\subsection{Step2Config 中的相关字段}
+
+与 \texttt{dynamics\_parameters\_urdf.csv} 直接相关的是：
+\begin{itemize}
+  \item \texttt{dynamics\_parameters\_urdf\_csv}：默认 \texttt{"dynamics\_parameters\_urdf.csv"}，即该 CSV 的写出路径（相对当前工作目录或绝对路径）。
+\end{itemize}
+
+%==============================================================================
+\section{estimateDynamicsParameters 主流程}
+%==============================================================================
+
+\subsection{1. Pinocchio 模型与重力（约 506--530 行）}
+
+\begin{itemize}
+  \item 使用 \texttt{pinocchio::urdf::buildModel(urdf\_file, pinocchio\_model)} 从传入的 \textbf{URDF 文件} 构建 \texttt{pinocchio\_model}。
+  \item 设置基座到世界的旋转与重力方向，并构造 \texttt{pinocchio\_data}。
+\end{itemize}
+
+\textbf{重要}：此后所有“来自 URDF”的惯性信息都来自该 \texttt{pinocchio\_model}，即本次运行时的 \texttt{urdf\_file}（配置或命令行）。
+
+\subsection{2. 加载采集数据（约 536--543 行）}
+
+调用 \texttt{loadDataFromCSV(data\_file)}，按行解析 CSV，得到 \texttt{collected\_data}：每行对应一个 \texttt{DataPoint}，包含 \texttt{time, q0..q6, dq0..dq6, ddq0..ddq6, tau0..tau6}。
+
+\subsection{3. 确定参数维数并构造 \texttt{theta\_urdf}（约 548--585 行）}
+
+\begin{enumerate}[leftmargin=*]
+  \item 用一组零状态 \texttt{(q\_test, dq\_test, ddq\_test)} 调用 \texttt{pinocchio::computeJointTorqueRegressor(...)}，得到回归矩阵 \texttt{Y\_test}，其列数 \texttt{n\_params = Y\_test.cols()}（7 自由度、每连杆 10 维时为 70）。
+  \item 若 \texttt{n\_params == 10*(njoints-1)}（例如 70），则从 \textbf{当前已加载的 URDF 模型} 构造 URDF 先验向量 \texttt{theta\_urdf}：
+\end{enumerate}
+
+\begin{lstlisting}[language=C++,basicstyle=\ttfamily\small,keywordstyle=\color{blue}]
+theta_urdf.resize(n_params);
+theta_urdf.setZero();
+for (pinocchio::JointIndex jid = 1; jid < pinocchio_model.njoints; ++jid) {
+  const auto pi = pinocchio_model.inertias[jid].toDynamicParameters(); // 10x1
+  const int base = 10 * (jid - 1);
+  theta_urdf.segment(base, 10) = pi;
+}
+\end{lstlisting}
+
+含义：
+\begin{itemize}
+  \item \texttt{pinocchio\_model.inertias[jid]} 是关节 \texttt{jid} 对应连杆的惯性（质量、质心、惯性张量），由 Pinocchio 在 \texttt{buildModel(urdf\_file, ...)} 时从 URDF 解析得到。
+  \item \texttt{toDynamicParameters()} 将该惯性转为 Pinocchio 约定的 10 维向量 $\bm{\pi}$，顺序为
+    \[
+    [m,\; mc_x,\; mc_y,\; mc_z,\; I_{xx},\; I_{xy},\; I_{yy},\; I_{xz},\; I_{yz},\; I_{zz}]^\top
+    \]
+    （质心处惯性，与回归矩阵列顺序一致）。
+  \item \texttt{theta\_urdf} 按关节索引依次堆叠：\texttt{theta\_urdf[0:9]} 为连杆 1，\texttt{theta\_urdf[10:19]} 为连杆 2，……，共 70 维。
+\end{itemize}
+
+因此，\textbf{\texttt{theta\_urdf} 完全由“本次运行所加载的 URDF”决定}，与采集数据、求解方式无关。
+
+\subsection{4. 构造全局回归矩阵与力矩向量（约 597--675 行）}
+
+对每个 \texttt{DataPoint}：
+\begin{itemize}
+  \item 用 \texttt{pinocchio::computeJointTorqueRegressor(pinocchio\_model, pinocchio\_data, q, dq, ddq)} 得到该时刻的 $7\times 70$ 回归矩阵 \texttt{Y}；
+  \item 将 \texttt{Y} 按行拼到 \texttt{Y\_all}，将 \texttt{tau} 拼到 \texttt{tau\_all}。
+\end{itemize}
+
+得到 $\bm{Y}_{\mathrm{all}}\bm{\theta}=\bm{\tau}_{\mathrm{all}}$，其中 $\bm{Y}_{\mathrm{all}}\in\mathbb{R}^{(7N)\times 70}$，$N$ 为数据点数。
+
+\subsection{5. 求解与投影（约 676--758 行）}
+
+\begin{itemize}
+  \item 用 SVD 求最小范数最小二乘解 \texttt{theta\_ls}；
+  \item 若存在 \texttt{theta\_urdf}，则用 Ridge 或 QP（OSQP，带质量下界 \texttt{m\_min}）求
+    \[
+    \min_{\bm{\theta}}\; \|\bm{Y}_{\mathrm{all}}\bm{\theta}-\bm{\tau}_{\mathrm{all}}\|^2 + \lambda\|\bm{\theta}-\bm{\theta}_{\mathrm{urdf}}\|^2,\quad \text{并满足质量等约束},
+    \]
+    得到 \texttt{theta\_estimated}；
+  \item 对 \texttt{theta\_estimated} 做物理约束投影 \texttt{projectThetaToPhysical(...)}：质量 $\ge$ \texttt{m\_min}，惯性对称正定且满足三角不等式；若某连杆投影后 $\mathrm{trace}(\bm{I})<\texttt{I\_trace\_min}$，则用 \texttt{theta\_urdf} 中该连杆的 10 维替换（避免写出 1e-6 量级无效惯量）。
+\end{itemize}
+
+\subsection{6. 写出各输出文件（约 753--871 行）}
+
+\begin{itemize}
+  \item \texttt{cfg.result\_file}：辨识结果摘要与全部 \texttt{theta\_estimated}；
+  \item \texttt{cfg.dynamics\_parameters\_csv}：\textbf{投影后的辨识参数} \texttt{theta\_estimated}（\texttt{parameter\_index, value}）；
+  \item \texttt{cfg.dynamics\_parameters\_ls\_csv}：Ridge 最小二乘解 \texttt{theta\_ls\_ridge}（无投影）；
+  \item \textbf{\texttt{cfg.dynamics\_parameters\_urdf\_csv}（即 \texttt{dynamics\_parameters\_urdf.csv}）}：见下节；
+  \item \texttt{cfg.dynamics\_physical\_parameters\_txt}：由 \texttt{theta\_estimated} 经 \texttt{FromDynamicParameters} 还原的质量/质心/惯性，与 URDF 对比；
+  \item \texttt{cfg.output\_urdf}：用 \texttt{theta\_estimated} 写回的辨识后 URDF。
+\end{itemize}
+
+%==============================================================================
+\section{dynamics\_parameters\_urdf.csv 的生成方式}
+%==============================================================================
+
+\subsection{写出条件与代码位置}
+
+仅当 \texttt{theta\_urdf.size() == n\_params}（即已成功从 URDF 构造 70 维先验）时才会写该文件。代码位于约 861--871 行：
+
+\begin{lstlisting}[language=C++,basicstyle=\ttfamily\small]
+if (theta_urdf.size() == n_params) {
+  std::ofstream param_file_urdf(cfg.dynamics_parameters_urdf_csv);
+  param_file_urdf << "parameter_index,value\n";
+  for (int i = 0; i < theta_urdf.size(); i++) {
+    param_file_urdf << i << "," << std::scientific << std::setprecision(10)
+                    << theta_urdf(i) << "\n";
+  }
+  param_file_urdf.close();
+}
+\end{lstlisting}
+
+即：将向量 \texttt{theta\_urdf} 按 \texttt{parameter\_index = 0,1,...,69} 逐行写出为 \texttt{parameter\_index,value} 两列 CSV。
+
+\subsection{theta\_urdf 的来源（与 URDF 的对应关系）}
+
+\begin{enumerate}[leftmargin=*]
+  \item \texttt{theta\_urdf} 在“构造回归矩阵”阶段（约 568--584 行）由 \textbf{当前加载的 Pinocchio 模型} 一次性构造，且之后不再修改。
+  \item 该模型来自 \texttt{pinocchio::urdf::buildModel(urdf\_file, pinocchio\_model)}，即 \textbf{本次运行时的 \texttt{urdf\_file}}（若未用命令行覆盖，则为配置中的 \texttt{urdf:}）。
+  \item 对每个关节 \texttt{jid = 1..7}，\texttt{theta\_urdf.segment(10*(jid-1), 10)} 等于 \texttt{pinocchio\_model.inertias[jid].toDynamicParameters()}，即该连杆在 URDF 中的惯性经 Pinocchio 转为 10 维动力学参数。
+\end{enumerate}
+
+因此：\textbf{\texttt{dynamics\_parameters\_urdf.csv} 中 70 个数值，就是“本次运行所用 URDF”中 7 个连杆的惯性，按 Pinocchio 的 10 维顺序依次堆叠后写出的结果}；与采集数据、Ridge/QP 求解、投影无关。
+
+\subsection{10 维顺序与 URDF 标签的对应}
+
+每连杆 10 维与 URDF 的对应关系为（参见 \texttt{docs/dynamic\_parameters\_10d\_conversion.md}）：
+\begin{center}
+\begin{tabular}{|c|l|l|}
+\hline
+\texttt{parameter\_index} & 含义 & URDF 对应 \\
+\hline
+0 & 质量 $m$ & \texttt{<mass value="..."/>} \\
+1,2,3 & $m c_x,\, m c_y,\, m c_z$ & \texttt{<origin xyz="cx cy cz"/>}（质心） \\
+4--9 & $I_{xx}, I_{xy}, I_{yy}, I_{xz}, I_{yz}, I_{zz}$（质心处） & \texttt{<inertia ixx ixy iyy ixz iyz izz/>} \\
+\hline
+\end{tabular}
+\end{center}
+
+索引 0--9 对应连杆 1，10--19 对应连杆 2，依此类推。
+
+%==============================================================================
+\section{小结}
+%==============================================================================
+
+\begin{itemize}
+  \item \texttt{step2\_dynamics\_parameter\_estimation} 的运行顺序为：加载配置与命令行 $\to$ 从 URDF 建 Pinocchio 模型 $\to$ 从 CSV 读采集数据 $\to$ 用 URDF 模型构造 \texttt{theta\_urdf} 并构造回归矩阵 \texttt{Y\_all}、\texttt{tau\_all} $\to$ Ridge/QP 求解得 \texttt{theta\_estimated} $\to$ 物理投影 $\to$ 写出多种 CSV 与 URDF。
+  \item \texttt{dynamics\_parameters\_urdf.csv} 的内容即为 \texttt{theta\_urdf}：由 \textbf{本次运行所加载的 URDF} 经 \texttt{pinocchio\_model.inertias[jid].toDynamicParameters()} 得到，按 \texttt{parameter\_index} 0--69 写出，与辨识结果、投影无关；用于对比或作为 Ridge 先验时的参考。
+\end{itemize}
+
+\end{document}

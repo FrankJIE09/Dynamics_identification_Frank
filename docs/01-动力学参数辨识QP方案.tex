@@ -1,0 +1,218 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{bm}
+
+\geometry{margin=2.5cm}
+
+\title{动力学参数辨识的带约束优化（QP）方案：理论详述}
+\author{Dynamics\_identification\_Frank}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本文从理论上详述基于二次规划（QP）的机器人动力学参数辨识方法。在回归模型 $\bm{\tau} = \bm{Y}\bm{\theta}$ 的基础上，将“质量为正、惯性张量对称正定且满足惯性椭球三角不等式”等物理约束显式纳入优化问题，得到在可行域内最小化拟合误差的辨识解，并与无约束最小二乘加后处理投影的方案进行对比。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{问题背景与回归模型}
+%==============================================================================
+
+\subsection{线性参数化动力学}
+
+机器人刚体动力学可写为关于惯性参数的线性形式（最小参数集）：
+\begin{equation}
+  \bm{\tau} = \bm{Y}(\bm{q},\dot{\bm{q}},\ddot{\bm{q}})\, \bm{\theta}
+  \label{eq:regressor}
+\end{equation}
+其中 $\bm{\tau}\in\mathbb{R}^n$ 为关节力矩，$\bm{Y}\in\mathbb{R}^{n\times p}$ 为回归矩阵，$\bm{\theta}\in\mathbb{R}^p$ 为动力学参数向量。对 $n_q=7$ 的机械臂采用每连杆 10 维最小惯性参数时，$p = 7\times 10 = 70$。
+
+\subsection{批量测量与最小二乘}
+
+设采集 $N$ 个时刻的数据，堆叠为：
+\begin{equation}
+  \bm{\tau}_{\mathrm{all}} = \bm{Y}_{\mathrm{all}}\, \bm{\theta},\qquad
+  \bm{Y}_{\mathrm{all}} \in \mathbb{R}^{(nN)\times p},\quad
+  \bm{\tau}_{\mathrm{all}} \in \mathbb{R}^{nN}.
+\end{equation}
+无约束最小二乘解为
+\begin{equation}
+  \min_{\bm{\theta}}\; \|\bm{Y}_{\mathrm{all}}\bm{\theta} - \bm{\tau}_{\mathrm{all}}\|_2^2
+  \quad\Rightarrow\quad
+  \bm{\theta}_{\mathrm{LS}} = (\bm{Y}_{\mathrm{all}}^\top \bm{Y}_{\mathrm{all}})^{\dagger}
+  \bm{Y}_{\mathrm{all}}^\top \bm{\tau}_{\mathrm{all}},
+\end{equation}
+或带 URDF 先验的 Ridge 解：
+\begin{equation}
+  \min_{\bm{\theta}}\; \|\bm{Y}_{\mathrm{all}}\bm{\theta} - \bm{\tau}_{\mathrm{all}}\|_2^2
+  + \lambda \|\bm{\theta} - \bm{\theta}_{\mathrm{urdf}}\|_2^2.
+\end{equation}
+当 $\bm{Y}_{\mathrm{all}}$ 不满秩或病态时，$\bm{\theta}_{\mathrm{LS}}$（或 Ridge 解）可能对应非物理惯性（负质量、非正定惯性张量），导致写进 URDF 后质量矩阵 $\bm{M}(\bm{q})$ 不正定，仿真或控制出错。
+
+%==============================================================================
+\section{物理约束的数学表述}
+%==============================================================================
+
+将 $\bm{\theta}$ 按连杆分块，第 $i$ 个连杆对应 10 维子向量 $\bm{\pi}_i\in\mathbb{R}^{10}$，通过 Pinocchio 的 \texttt{Inertia::FromDynamicParameters} 映射为质量 $m_i$、质心 $\bm{c}_i\in\mathbb{R}^3$、惯性张量 $\bm{I}_i\in\mathbb{R}^{3\times 3}$（对称）。物理可行性要求如下。
+
+\subsection{质量约束}
+
+每个连杆质量为正，且通常不低于一给定下限（数值稳定性或工艺下限）：
+\begin{equation}
+  m_i \geq m_{\min} > 0,\qquad i=1,\ldots,n_{\mathrm{links}}.
+\end{equation}
+在最小参数集中，$m_i$ 由 $\bm{\pi}_i$ 的第一维给出，故这是关于 $\bm{\theta}$ 的线性不等式约束（每个连杆一条）。
+
+\subsection{惯性张量对称正定}
+
+惯性张量在连杆局部坐标系下必须对称正定：
+\begin{equation}
+  \bm{I}_i = \bm{I}_i^\top,\qquad \bm{I}_i \succ 0.
+\end{equation}
+对称性由参数化自动保证；$\bm{I}_i\succ 0$ 等价于特征值全为正：
+\begin{equation}
+  \lambda_{i,1},\, \lambda_{i,2},\, \lambda_{i,3} > 0.
+\end{equation}
+等价地，所有顺序主子式为正，或存在 Cholesky 分解 $\bm{I}_i = \bm{L}_i\bm{L}_i^\top$（$\bm{L}_i$ 下三角且对角元为正）。正定性关于 $\bm{\pi}_i$ 是非线性的（$\bm{\pi}_i \mapsto \bm{I}_i$ 为非线性映射），因此约束在参数空间 $\bm{\theta}$ 上为非线性。
+
+\subsection{惯性椭球的三角不等式}
+
+刚体惯性张量的三个主惯性矩（即 $\bm{I}_i$ 的特征值）除为正外，还满足“三角不等式”：
+\begin{equation}
+  \lambda_{i,a} + \lambda_{i,b} \geq \lambda_{i,c}
+  \quad\text{（$a,b,c$ 为 $1,2,3$ 的任意排列）}.
+\end{equation}
+例如 $\lambda_1 \leq \lambda_2 \leq \lambda_3$ 时，需
+\begin{equation}
+  \lambda_1 + \lambda_2 \geq \lambda_3.
+\end{equation}
+该约束与 $\bm{I}_i\succ 0$ 一起，构成“物理可实现惯性张量”的完整条件。
+
+%==============================================================================
+\section{带约束优化的目标与决策变量}
+%==============================================================================
+
+\subsection{决策变量两种取法}
+
+\begin{enumerate}[label=(\alph*)]
+  \item \textbf{直接用 $\bm{\theta}$}：决策变量为 $\bm{\theta}\in\mathbb{R}^p$。目标与 Ridge 一致；约束需用 $\bm{\theta}$ 表示：$m_i(\bm{\pi}_i)\geq m_{\min}$ 为线性，$\bm{I}_i(\bm{\pi}_i)\succ 0$ 及三角不等式为非线性（且 $\bm{\pi}_i\mapsto\bm{I}_i$ 的显式形式较复杂），适合在求解器中用黑箱约束或逐次线性化/凸近似。
+  \item \textbf{用每连杆 $(m_i,\bm{c}_i,\bm{I}_i)$}：决策变量为各连杆的质量、质心、对称惯性矩阵，再通过最小参数集与 $\bm{\theta}$ 的对应关系写回 $\bm{\theta}$，或直接在回归的“物理参数”形式下建模型。此时 $m_i\geq m_{\min}$ 为线性，$\bm{I}_i\succ 0$ 可用 Cholesky 或半定约束表述，三角不等式为特征值或对称矩阵元素的线性/二阶锥约束。表述更直观，但变量与回归矩阵的耦合需在优化中处理（例如用 $\bm{\theta}=\bm{\phi}(m_1,\bm{c}_1,\bm{I}_1,\ldots)$ 代入目标）。
+\end{enumerate}
+
+以下以决策变量为 $\bm{\theta}$ 为主，约束在“$\bm{\theta}$ 空间”中表述（便于与现有 Ridge 流程一致）；等价地可改写为在 $(m,\bm{c},\bm{I})$ 空间中的约束。
+
+\subsection{目标函数}
+
+带正则的二次目标（与 Ridge 一致）：
+\begin{equation}
+  J(\bm{\theta}) = \|\bm{Y}_{\mathrm{all}}\bm{\theta} - \bm{\tau}_{\mathrm{all}}\|_2^2
+  + \lambda\,\|\bm{\theta} - \bm{\theta}_{\mathrm{urdf}}\|_2^2.
+\end{equation}
+展开为标准的 QP 形式：
+\begin{equation}
+  J(\bm{\theta}) = \frac{1}{2}\bm{\theta}^\top \bm{H}\,\bm{\theta} + \bm{g}^\top\bm{\theta} + \mathrm{const},
+\end{equation}
+其中
+\begin{equation}
+  \bm{H} = 2\bigl(\bm{Y}_{\mathrm{all}}^\top \bm{Y}_{\mathrm{all}} + \lambda\bm{I}\bigr),\qquad
+  \bm{g} = -2\bigl(\bm{Y}_{\mathrm{all}}^\top \bm{\tau}_{\mathrm{all}} + \lambda\bm{\theta}_{\mathrm{urdf}}\bigr).
+\end{equation}
+$\bm{H}\succeq 0$，无约束时该 QP 有唯一最小解（当 $\lambda>0$ 时 $\bm{H}\succ 0$）。
+
+%==============================================================================
+\section{约束的表述方式（用于 QP/SOCP/SDP）}
+%==============================================================================
+
+\subsection{质量约束}
+
+设 $\bm{\theta}$ 中与第 $i$ 个连杆质量对应的分量为 $\theta_{k_i}$（在 10 维块中的第一维），则
+\begin{equation}
+  \theta_{k_i} \geq m_{\min},\qquad i=1,\ldots,n_{\mathrm{links}}.
+\end{equation}
+这是关于 $\bm{\theta}$ 的线性不等式，可直接用于 QP 的 $\bm{A}\bm{\theta}\leq \bm{b}$ 或 $\bm{A}_{\mathrm{eq}}\bm{\theta}=\bm{b}_{\mathrm{eq}}$ 的等价形式（如 $-\theta_{k_i}\leq -m_{\min}$）。
+
+\subsection{惯性张量正定：半定规划（SDP）表述}
+
+对第 $i$ 个连杆，要求 $\bm{I}_i \succeq \delta\bm{I}$（$\delta>0$ 为小常数，保证正定）。$\bm{I}_i$ 由 $\bm{\pi}_i$ 唯一确定，记作 $\bm{I}_i(\bm{\pi}_i)$。则约束为
+\begin{equation}
+  \bm{I}_i(\bm{\pi}_i) - \delta\bm{I} \succeq 0.
+\end{equation}
+这是关于 $\bm{\pi}_i$ 的线性矩阵不等式（LMI）：$\bm{I}_i$ 的 6 个独立分量是 $\bm{\pi}_i$ 中若干分量的线性函数，因此 LMI 关于 $\bm{\pi}_i$ 是线性的，关于 $\bm{\theta}$ 也是线性的。整体问题变为：二次目标 + 线性不等式（质量）+ 多个 LMI（每连杆一个），即 \textbf{半定规划（SDP）}，可用 Mosek、SeDuMi、SDPT3 等求解。
+
+\subsection{惯性张量正定：Cholesky 与二阶锥（SOC）表述}
+
+$\bm{I}_i \succ 0$ 等价于存在下三角 $\bm{L}_i$ 且对角元 $L_{jj}>0$，使得 $\bm{I}_i = \bm{L}_i\bm{L}_i^\top$。将 $\bm{L}_i$ 的元素作为辅助变量，约束 $\bm{I}_i = \bm{L}_i\bm{L}_i^\top$ 为关于 $\bm{L}_i$ 与 $\bm{I}_i$ 的二次等式；再对 $\bm{\pi}_i$ 与 $\bm{I}_i$ 的关系（线性）做等式约束。对角元 $L_{jj}>0$ 可写为 $L_{jj}\geq \epsilon$。此类约束可进一步用二阶锥（SOC）或线性化手段嵌入 SOCP，从而用 OSQP（若可写为 QP+锥）、ECOS、Mosek 等求解。
+
+\subsection{惯性三角不等式的线性表述}
+
+在主惯性矩 $\lambda_1\leq \lambda_2\leq \lambda_3$ 下，三角不等式为 $\lambda_1+\lambda_2 - \lambda_3 \geq 0$。若在优化中显式引入特征值变量 $\lambda_{i,1},\lambda_{i,2},\lambda_{i,3}$ 及特征向量，则需满足 $\bm{I}_i = \bm{V}\bm{\Lambda}\bm{V}^\top$、$\bm{V}^\top\bm{V}=\bm{I}$，约束非凸且变量增多。更实用的做法是：
+\begin{itemize}
+  \item 在 \textbf{SDP 表述}中，仅约束 $\bm{I}_i \succeq \delta\bm{I}$；物理上“可实现”的惯性张量自动满足三角不等式（正定对称 3\times 3 矩阵若来自刚体惯性，则必满足），因此若回归/数据导致不满足，可视为模型或数据问题，或
+  \item 在 \textbf{后处理投影}中显式强制三角不等式（如对特征值裁剪后再组合），而不在 QP/SDP 中写。
+\end{itemize}
+若坚持在优化中写三角不等式，可在每连杆上引入 $\lambda$ 与 $\bm{I}_i$ 的等式 $\bm{I}_i\bm{v}_k = \lambda_k\bm{v}_k$，再加 $\lambda_1+\lambda_2\geq \lambda_3$ 等，问题会变为非凸，需用非线性规划或序列凸近似。
+
+%==============================================================================
+\section{标准 QP/SDP 形式小结}
+%==============================================================================
+
+\subsection{仅质量约束（线性不等式）}
+
+若暂时只保留 $m_i\geq m_{\min}$，则问题为
+\begin{align}
+  \min_{\bm{\theta}}\quad & \frac{1}{2}\bm{\theta}^\top \bm{H}\,\bm{\theta} + \bm{g}^\top\bm{\theta} \\
+  \text{s.t.}\quad & \bm{A}\,\bm{\theta} \leq \bm{b}
+\end{align}
+（将 $\theta_{k_i}\geq m_{\min}$ 写为 $-\theta_{k_i}\leq -m_{\min}$ 放入 $\bm{A},\bm{b}$）。这是 \textbf{标准 QP}，可用 OSQP、qpOASES、QuadProg 等求解，实现简单、计算高效。
+
+\subsection{质量 + 惯性正定（LMI）}
+
+在质量约束基础上，对每连杆增加 $\bm{I}_i(\bm{\pi}_i) - \delta\bm{I} \succeq 0$。目标仍为 $\bm{\theta}$ 的二次函数，约束为线性不等式 + 多个 LMI，即 \textbf{SDP}：
+\begin{align}
+  \min_{\bm{\theta}}\quad & \frac{1}{2}\bm{\theta}^\top \bm{H}\,\bm{\theta} + \bm{g}^\top\bm{\theta} \\
+  \text{s.t.}\quad & \bm{A}\,\bm{\theta} \leq \bm{b}, \\
+  & \bm{I}_i(\bm{\pi}_i) \succeq \delta\bm{I},\quad i=1,\ldots,n_{\mathrm{links}}.
+\end{align}
+需将 $\bm{I}_i(\bm{\pi}_i)$ 用 $\bm{\pi}_i$（即 $\bm{\theta}$ 的相应分量）的线性函数写出（Pinocchio 的 10 维参数与 $m,\bm{c},\bm{I}$ 的对应关系为线性），即可用 SDP 求解器求解。
+
+\subsection{与“无约束 + 投影”的对比}
+
+\begin{itemize}
+  \item \textbf{无约束 Ridge + 投影}：先求无约束 Ridge 解 $\bm{\theta}^*$，再对每连杆 $(m_i,\bm{c}_i,\bm{I}_i)$ 做投影（$m_i\leftarrow\max(m_i,m_{\min})$，$\bm{I}_i$ 做最近正定与三角不等式修正），写回 $\bm{\theta}$。优点是不需要 QP/SDP 求解器，实现简单；缺点是投影后的 $\bm{\theta}$ 不再是最小化 $J(\bm{\theta})$ 的解，拟合误差会略大。
+  \item \textbf{QP/SDP}：在可行域（$m_i\geq m_{\min}$，$\bm{I}_i\succeq \delta\bm{I}$）内直接最小化 $J(\bm{\theta})$，得到的是“物理可行且拟合最优”的解；缺点是需要引入求解器并写清 $\bm{I}_i(\bm{\pi}_i)$ 的线性表达式或 LMI 接口。
+\end{itemize}
+
+%==============================================================================
+\section{实现要点与推荐流程}
+%==============================================================================
+
+\begin{enumerate}
+  \item \textbf{回归矩阵与数据}：与现有 step2 一致，用 Pinocchio 计算 $\bm{Y}_{\mathrm{all}}$，采集 $\bm{\tau}_{\mathrm{all}}$。
+  \item \textbf{URDF 先验}：从参考 URDF 得到 $\bm{\theta}_{\mathrm{urdf}}$，用于 Ridge 项 $\lambda\|\bm{\theta}-\bm{\theta}_{\mathrm{urdf}}\|^2$。
+  \item \textbf{质量约束}：从 Pinocchio 的 10 维参数顺序确定每块第一维对应质量，写出 $\bm{A},\bm{b}$。
+  \item \textbf{惯性 LMI}：对每个 10 维块，用 \texttt{Inertia::FromDynamicParameters} 的线性关系写出 $\bm{I}_i$ 的 6 个独立元关于 $\bm{\pi}_i$ 的线性表达式，再转为 SDP 的 LMI 格式（或先用“仅质量约束”的 QP 做简化版）。
+  \item \textbf{求解}：调用 QP 求解器（仅质量）或 SDP 求解器（质量+惯性正定），得到 $\bm{\theta}_{\mathrm{QP}}$；若未在优化中加三角不等式，可对结果再做一次三角不等式投影后写 URDF。
+\end{enumerate}
+
+%==============================================================================
+\section{参考文献与工具}
+%==============================================================================
+
+\begin{itemize}
+  \item Pinocchio: \url{https://stack-of-tasks.github.io/pinocchio/}
+  \item OSQP (QP): \url{https://osqp.org/}
+  \item Mosek (QP/SDP/SOCP): \url{https://www.mosek.com/}
+  \item 惯性参数物理条件：刚体惯性张量正定与三角不等式的标准结论见机器人学教材（如 Khalil, Spong 等）的动力学参数辨识章节。
+\end{itemize}
+
+\end{document}
