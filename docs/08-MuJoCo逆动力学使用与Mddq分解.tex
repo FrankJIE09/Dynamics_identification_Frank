@@ -1,0 +1,190 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{bm}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\geometry{margin=2.5cm}
+
+\title{MuJoCo 逆动力学使用与 $M\ddot{q}$ 分解问题}
+\author{Dynamics\_identification\_Frank}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+在对比 Pinocchio 与 MuJoCo 的逆动力学时，若直接依赖 \texttt{mj\_inverse} 的输出做 $\tau = g(q) + M(q)\ddot{q} + C(q,\dot{q})\dot{q}$ 的分解，会出现“质量矩阵 $M$ 与加速度 $\ddot{q}$ 在两边一致，但惯性项 $M\ddot{q}$ 却相差巨大”的悖论。本文说明该现象源于 MuJoCo 中 \texttt{mj\_inverse} 与 \texttt{mj\_forward} 的调用顺序对 \texttt{qfrc\_inverse} 的语义影响，并给出正确做法：使用 \texttt{qfrc\_bias} 与 \texttt{mj\_makeM} 显式构造 $\tau$ 及各分项，从而得到与 Pinocchio 一致且自洽的 $M\ddot{q}$ 分解。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{背景与问题现象}
+
+\subsection{逆动力学分解}
+
+机器人逆动力学将关节位置 $q$、速度 $\dot{q}$、加速度 $\ddot{q}$ 映射为关节力矩 $\tau$：
+\begin{equation}
+  \tau = M(q)\,\ddot{q} + C(q,\dot{q})\,\dot{q} + g(q)
+  \label{eq:inverse-dyn}
+\end{equation}
+其中 $M(q)$ 为质量矩阵，$C(q,\dot{q})\dot{q}$ 为科氏/离心项，$g(q)$ 为重力项。在动力学辨识与仿真对比中，常需对同一组 $(q,\dot{q},\ddot{q})$ 分别用 Pinocchio（读 URDF）与 MuJoCo（读 XML）计算 $\tau$ 并分解为上述三项，以排查模型或实现差异。
+
+\subsection{观察到的异常}
+
+在某组实测/仿真得到的 $(q,\dot{q},\ddot{q})$ 上，对比结果如下（节选）：
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Pinocchio}：$\tau_0 \approx -3\,\mathrm{Nm}$，$g_0 \approx -3.1$，$(M\ddot{q})_0 \approx -0.002$，$(C\dot{q})_0 \approx 0.03$。
+  \item \textbf{MuJoCo}（当时用法）：$\tau_0 \approx 6\times 10^4\,\mathrm{Nm}$，$g_0 \approx -3.1$，$(M\ddot{q})_0 \approx -1407$，$(C\dot{q})_0 \approx 6\times 10^4$。
+\end{itemize}
+
+进一步检查发现：
+\begin{itemize}[leftmargin=*]
+  \item 两边的 $g(q)$ 几乎完全一致；
+  \item 通过 Pinocchio 的 \texttt{data.M} 与 MuJoCo 的 \texttt{mj\_makeM} + \texttt{mj\_fullM} 得到的 $7\times 7$ 质量矩阵 $M(q)$ 几乎相同（元素差约 $10^{-6}$，Frobenius 范数约 $4.7\times 10^{-6}$）；
+  \item $\ddot{q}$ 在两边完全相同。
+\end{itemize}
+
+因此从形式上看，出现了“$M$ 一样、$\ddot{q}$ 一样，但 $M\ddot{q}$ 不一样”的矛盾：直接用 $M\ddot{q}$ 计算得到的惯性项约为 $-0.002$，而通过 MuJoCo 分解得到的“惯性项”却约为 $-1407$。
+
+\section{MuJoCo 动力学接口说明}
+
+\subsection{广义方程与内部量}
+
+MuJoCo 的广义动力学方程可写成
+\begin{equation}
+  M(q)\,\ddot{q} + h(q,\dot{q}) = Q
+  \label{eq:mujoco-dyn}
+\end{equation}
+其中 $Q$ 为广义力（含执行器输出、约束反力等），$h(q,\dot{q})$ 为“偏差力”（bias force），包含重力、科氏、离心等所有非 $M\ddot{q}$ 的项。
+
+在 \texttt{mjData} 中与逆动力学相关的量包括：
+\begin{itemize}[leftmargin=*]
+  \item \texttt{qfrc\_bias}：即式 \eqref{eq:mujoco-dyn} 中的 $h(q,\dot{q})$，对应
+  \[
+    \texttt{qfrc\_bias} = C(q,\dot{q})\dot{q} + g(q);
+  \]
+  \item \texttt{qfrc\_inverse}：由 \texttt{mj\_inverse} 写入，其语义见下文；
+  \item \texttt{qM} / \texttt{M}：由 \texttt{mj\_makeM} 填充的质量矩阵（稀疏格式），再经 \texttt{mj\_fullM} 可得到稠密 $M(q)$。
+\end{itemize}
+
+因此，在不考虑约束与外力时，正确的逆动力学应为
+\begin{equation}
+  \tau = M(q)\,\ddot{q} + \texttt{qfrc\_bias}.
+  \label{eq:tau-correct}
+\end{equation}
+
+\subsection{\texttt{mj\_forward} 与 \texttt{mj\_inverse} 的文档语义}
+
+文档中说明：
+\begin{itemize}[leftmargin=*]
+  \item \texttt{mj\_forward}：在给定状态 $(q,\dot{q})$ 与力下，由力求加速度等；
+  \item \texttt{mj\_inverse}：在给定状态与加速度 \texttt{qacc} 下，求产生该加速度所需的力，结果写入 \texttt{qfrc\_inverse}。
+\end{itemize}
+
+从式 \eqref{eq:mujoco-dyn} 理解，若 $Q = \tau$ 且无其他外力，则 $\tau = M\ddot{q} + h$，即 \texttt{qfrc\_inverse} 在概念上应等于 $M\,\texttt{qacc} + \texttt{qfrc\_bias}$。但实际调用顺序会改变 \texttt{qfrc\_inverse} 的数值，见下一节。
+
+\section{Bug 根源：\texttt{mj\_inverse} 的调用顺序}
+
+\subsection{两种错误用法及现象}
+
+在脚本中曾用以下方式从 MuJoCo 得到 $\tau$ 并做分解：
+\begin{enumerate}[leftmargin=*]
+  \item 设置 \texttt{data.qpos = q}, \texttt{data.qvel = $\dot{q}$}, \texttt{data.qacc = $\ddot{q}$}；
+  \item 调用 \texttt{mj\_inverse(model, data)}；
+  \item 将 \texttt{data.qfrc\_inverse} 视为总力矩 $\tau$；
+  \item 再通过“令 $\ddot{q}=0$ 或 $\dot{q}=0$”等组合调用 \texttt{mj\_inverse}，用差值得到 $g(q)$、$M\ddot{q}$、$C\dot{q}$。
+\end{enumerate}
+
+实测结果与预期不符：
+
+\begin{description}[leftmargin=*,style=nextline]
+  \item[用法 A：不先调用 \texttt{mj\_forward}，直接 \texttt{mj\_inverse}]  
+  \texttt{qfrc\_inverse} 中出现数量级为 $10^4 \sim 10^5$ 的异常大力矩（如第 0 轴约 $6\times 10^4\,\mathrm{Nm}$），与 Pinocchio 的约 $-3\,\mathrm{Nm}$ 完全不符。由此分解出的“惯性项”约 $-1407$，与直接用 $M\ddot{q}$ 得到的约 $-0.002$ 不一致。
+
+  \item[用法 B：先 \texttt{mj\_forward} 再 \texttt{mj\_inverse}]  
+  \texttt{qfrc\_inverse} 几乎变为全零向量，无法得到有意义的 $\tau$ 或 $M\ddot{q}$。
+\end{description}
+
+因此，在上述两种调用方式下，都不能用 \texttt{qfrc\_inverse} 可靠地得到“$\tau = M\ddot{q} + C\dot{q} + g$”的分解；尤其用法 A 会导致“$M$、$\ddot{q}$ 都对，但 $M\ddot{q}$ 错”的表象。
+
+\subsection{为何会出现“$M\ddot{q}$ 不一致”}
+
+\begin{itemize}[leftmargin=*]
+  \item $M(q)$ 来自 \texttt{mj\_makeM}（在 \texttt{mj\_forward} 之后调用），与当前 $q$ 一致，且与 Pinocchio 的 $M$ 数值一致。
+  \item $\ddot{q}$ 在两边相同。
+  \item 因此 $M(q)\ddot{q}$ 的“正确值”应由 $M$ 与 $\ddot{q}$ 直接相乘得到（约 $-0.002$ 等）。
+  \item 而“分解得到的惯性项”来自 $\tau_{\mathrm{full}} - \tau_{C\dot{q}+g}$，其中 $\tau_{\mathrm{full}}$ 取的是 \texttt{qfrc\_inverse}（用法 A 下为错误大力矩），故该差值被错误放大，得到约 $-1407$。
+\end{itemize}
+
+所以“$M$ 和 $\ddot{q}$ 一样但 $M\ddot{q}$ 不一样”是因为：\textbf{打印的 $M\ddot{q}$ 并非真正的 $M(q)\ddot{q}$，而是基于错误的 \texttt{qfrc\_inverse} 反推出来的惯性项}。
+
+\section{正确做法：用 \texttt{qfrc\_bias} 与 $M$ 显式构造}
+
+\subsection{原则}
+
+不依赖 \texttt{mj\_inverse} 的输出做分解，而是：
+\begin{enumerate}[leftmargin=*]
+  \item 用 \texttt{mj\_forward} 在不同 $(q,\dot{q},\ddot{q})$ 下得到 \texttt{qfrc\_bias}，从而得到 $g(q)$ 与 $C(q,\dot{q})\dot{q}$；
+  \item 用 \texttt{mj\_makeM} + \texttt{mj\_fullM} 得到 $M(q)$，再计算 $M(q)\ddot{q}$；
+  \item 显式构造 $\tau = g(q) + M(q)\ddot{q} + C(q,\dot{q})\dot{q}$。
+\end{enumerate}
+
+这样 $M\ddot{q}$ 与“打印的惯性项”都来自同一 $M(q)\ddot{q}$，自然一致，且与 Pinocchio 的分解一致。
+
+\subsection{具体步骤（与脚本 \texttt{debug\_one\_sample\_M\_matrix.py} 一致）}
+
+\paragraph{1) 重力项 $g(q)$}
+\begin{itemize}[leftmargin=*]
+  \item 设 \texttt{qpos = $q$}, \texttt{qvel = 0}, \texttt{qacc = 0}；
+  \item 调用 \texttt{mj\_forward(model, data)}；
+  \item $g(q) := \texttt{data.qfrc\_bias}$（取前 7 维等所需维度）。
+\end{itemize}
+
+\paragraph{2) 科氏/离心项 $C(q,\dot{q})\dot{q}$}
+\begin{itemize}[leftmargin=*]
+  \item 设 \texttt{qpos = $q$}, \texttt{qvel = $\dot{q}$}, \texttt{qacc = 0}；
+  \item 调用 \texttt{mj\_forward(model, data)}；
+  \item $\texttt{qfrc\_bias}$ 此时为 $C(q,\dot{q})\dot{q} + g(q)$；
+  \item $C(q,\dot{q})\dot{q} := \texttt{qfrc\_bias} - g(q)$。
+\end{itemize}
+
+\paragraph{3) 质量矩阵 $M(q)$ 与惯性项 $M(q)\ddot{q}$}
+\begin{itemize}[leftmargin=*]
+  \item 设 \texttt{qpos = $q$}, \texttt{qvel = 0}, \texttt{qacc = 0}；
+  \item 调用 \texttt{mj\_forward(model, data)}，再调用 \texttt{mj\_makeM(model, data)}；
+  \item 用 \texttt{mj\_fullM(model, M\_dense, data.qM)} 得到稠密矩阵 $M$（如 $7\times 7$）；
+  \item $M(q)\ddot{q} := M \cdot \ddot{q}$（矩阵乘向量）。
+\end{itemize}
+
+\paragraph{4) 总力矩}
+\begin{equation}
+  \tau := g(q) + M(q)\ddot{q} + C(q,\dot{q})\dot{q}.
+\end{equation}
+
+\subsection{验证结果}
+
+按上述实现后：
+\begin{itemize}[leftmargin=*]
+  \item Pinocchio 与 MuJoCo 的 $\tau$、$g(q)$、$M\ddot{q}$、$C\dot{q}$ 在数值上一致（差异在 $10^{-6}$ 量级）；
+  \item MuJoCo 侧“打印的惯性项”与 $M\ddot{q}$（即 $M@\ddot{q}$）完全一致，校验最大差为 0；
+  \item “$M$ 和 $\ddot{q}$ 一样但 $M\ddot{q}$ 不一样”的现象消失。
+\end{itemize}
+
+\section{小结与建议}
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{现象}：在对比 Pinocchio 与 MuJoCo 逆动力学时，若用 \texttt{mj\_inverse} 的输出做 $\tau = g + M\ddot{q} + C\dot{q}$ 的分解，会出现 $M$、$\ddot{q}$ 两边一致，但“分解得到的 $M\ddot{q}$”与直接计算的 $M\ddot{q}$ 相差巨大的情况。
+  \item \textbf{原因}：\texttt{qfrc\_inverse} 的数值强烈依赖是否、以及何时调用 \texttt{mj\_forward}；在“不先 forward 直接 inverse”的用法下会得到错误大力矩，导致分解出的惯性项错误。
+  \item \textbf{正确做法}：用 \texttt{mj\_forward} 得到 \texttt{qfrc\_bias}（$= C\dot{q} + g$），用 \texttt{mj\_makeM} 得到 $M(q)$，自行计算 $\tau = M\ddot{q} + \texttt{qfrc\_bias}$ 及各分项，不依赖 \texttt{mj\_inverse} 做分解。
+  \item \textbf{代码}：项目中的 \texttt{scripts/debug\_one\_sample\_M\_matrix.py} 已按此方式实现 MuJoCo 侧的逆动力学与 $M$ 矩阵对比，可作为参考。
+\end{enumerate}
+
+\end{document}

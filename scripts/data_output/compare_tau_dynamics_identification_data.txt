@@ -1,0 +1,6 @@
+CSV: /home/lenovo/Frank/code/Dynamics_identification_Frank/src/config/dynamics_identification_data.csv
+URDF: /home/lenovo/Frank/code/Dynamics_identification_Frank/scripts/data_output/AR5-5_07R-W4C4A2_identified_inertia_com_friction.urdf
+样本数: 5901
+整体 RMSE: 38.343456 Nm
+最大绝对误差: 123.128456 Nm
+按关节 RMSE: J0=101.122136 J1=0.566188 J2=0.614351 J3=0.199917 J4=0.298194 J5=7.974501 J6=1.199224

@@ -29,9 +29,16 @@ from step2_partial_common import (
     write_result_csvs_and_urdf,
     run_validation,
     run_validation_initial_urdf,
+    check_inertia_positive_definite,
 )
 
 OUTPUT_URDF_BASENAME = "AR5-5_07R-W4C4A2_identified_mass_friction_only.urdf"
+
+# 参数（直接在本文件中设置，不通过 config 导入）
+LAMBDA_REL = 1e-4
+LAM_FRICTION = 1e-8
+M_MIN = 1e-4
+I_EPS = 1e-6
 
 
 def _mass_only_column_indices(n_links: int) -> list[int]:
@@ -83,8 +90,8 @@ def main():
     n_m = len(col_inds)
     n_x = n_m + n_frict
 
-    lam_m = float(cfg.get("lambda_rel", 1e-4)) * (np.trace(Y_m.T @ Y_m) / max(n_m, 1))
-    lam_frict = float(cfg.get("lam_friction", 1e-8))
+    lam_m = LAMBDA_REL * (np.trace(Y_m.T @ Y_m) / max(n_m, 1))
+    lam_frict = LAM_FRICTION
     L_diag = np.ones(n_x)
     L_diag[:n_m] = lam_m
     L_diag[n_m:] = lam_frict
@@ -93,7 +100,7 @@ def main():
 
     P = 2.0 * (W_ext.T @ W_ext + np.diag(L_diag))
     q = -2.0 * (W_ext.T @ tau_resid + L_diag * x_prior)
-    m_min = float(cfg.get("m_min", 1e-4))
+    m_min = M_MIN
 
     if OSQP_AVAILABLE and n_links == 7:
         n_ineq = n_links + n_joints + n_joints
@@ -155,6 +162,7 @@ def main():
         "质心与惯量用 URDF，辨识 m(7)+Fv/Fc，约束 m≥m_min, Fv≥0, Fc≥0\n"
         f"RMSE(tau): {rmse:.6e}\n"
     )
+    cfg["I_eps"] = I_EPS
     write_result_csvs_and_urdf(
         out,
         theta_estimated,
@@ -170,6 +178,10 @@ def main():
     )
     run_validation_initial_urdf(out, collected, theta_urdf, n_params, n_joints, urdf_file)
     run_validation(out, collected, theta_estimated, Fv, Fc, n_params, n_joints, urdf_file)
+    # 使用原始 URDF 的 θ 验证惯量正定性
+    check_inertia_positive_definite(theta_urdf, n_links)
+    check_inertia_positive_definite(theta_estimated, n_links)
+
     print(f"\n  完成。输出 URDF: {out['output_urdf']}")
 
 

@@ -183,6 +183,34 @@ def write_result_csvs_and_urdf(
         )
 
 
+def check_inertia_positive_definite(theta: np.ndarray, n_links: int, tol: float = 1e-10) -> None:
+    """验证各连杆质心处惯量 I_com 的正定性（由 theta 中 I^o 经平行轴换算），仅打印结果不做处理。"""
+    if theta.size < n_links * 10:
+        print("  [正定性] 参数长度不足，跳过惯量正定性检查")
+        return
+    print("\n========================================")
+    print("惯量矩阵正定性验证（I_com 质心处惯量，仅检查，不修改参数）")
+    print("========================================")
+    for j in range(n_links):
+        base = 10 * j
+        m = float(theta[base])
+        if m < 1e-12:
+            print(f"  连杆 {j}: 质量过小，跳过")
+            continue
+        c = np.asarray(theta[base + 1 : base + 4], dtype=np.float64) / m
+        # Pinocchio 10 维惯量顺序: (Ixx, Ixy, Iyy, Ixz, Iyz, Izz) = theta[4:10]，为 I^o 绕原点
+        Ixx, Ixy, Iyy = theta[base + 4], theta[base + 5], theta[base + 6]
+        Ixz, Iyz, Izz = theta[base + 7], theta[base + 8], theta[base + 9]
+        I_o = np.array([[Ixx, Ixy, Ixz], [Ixy, Iyy, Iyz], [Ixz, Iyz, Izz]], dtype=np.float64)
+        I_com = _inertia_origin_to_com(I_o, m, c)
+        eigv = np.linalg.eigvalsh(I_com)
+        lam_min = float(np.min(eigv))
+        pd = lam_min >= -tol
+        print(f"  连杆 {j}: 正定={pd}, 最小特征值(I_com)={lam_min:.6e}")
+    print("  说明: 验证的是写入 URDF 的质心处惯量 I_com，未做修正。")
+    print("========================================")
+
+
 def run_validation(
     out: dict,
     collected: list,

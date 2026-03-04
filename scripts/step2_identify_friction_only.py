@@ -28,9 +28,14 @@ from step2_partial_common import (
     setup_for_partial_identification,
     write_result_csvs_and_urdf,
     run_validation,
+    check_inertia_positive_definite,
 )
 
 OUTPUT_URDF_BASENAME = "AR5-5_07R-W4C4A2_identified_friction_only.urdf"
+
+# 参数（直接在本文件中设置，不通过 config 导入）
+LAM_FRICTION = 1e-8
+I_EPS = 1e-6
 
 
 def main():
@@ -67,7 +72,7 @@ def main():
     n_frict = 2 * n_joints
     W_frict = W_all[:, n_params : n_params + n_frict]
     tau_resid = tau_all - Y_all @ theta_urdf
-    lam = float(cfg.get("lam_friction", 1e-8))
+    lam = LAM_FRICTION
     P = 2.0 * (W_frict.T @ W_frict + lam * np.eye(n_frict))
     q = -2.0 * (W_frict.T @ tau_resid)
 
@@ -106,6 +111,7 @@ def main():
     tau_pred = Y_all @ theta_estimated + W_frict @ x
     rmse = np.sqrt(np.mean((tau_all - tau_pred) ** 2))
     result_summary = f"部分辨识(仅摩擦)\nθ 使用 URDF，辨识 Fv/Fc\nRMSE(tau): {rmse:.6e}\n"
+    cfg["I_eps"] = I_EPS
     write_result_csvs_and_urdf(
         out,
         theta_estimated,
@@ -120,6 +126,7 @@ def main():
         result_summary=result_summary,
     )
     run_validation(out, collected, theta_estimated, Fv, Fc, n_params, n_joints, urdf_file)
+    check_inertia_positive_definite(theta_estimated, n_links)
     print(f"\n  完成。输出 URDF: {out['output_urdf']}")
 
 

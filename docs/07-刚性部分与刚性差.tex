@@ -1,0 +1,246 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{bm}
+\usepackage{booktabs}
+
+\geometry{margin=2.5cm}
+
+\title{刚性部分与刚性差：原理与公式}
+\author{Dynamics\_identification\_Frank}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本文从原理和公式出发，说明动力学辨识中``刚性部分''的含义、为何会出现两种不同的刚性表示，以及``刚性差''的严格定义与来源。对应程序：\texttt{step2\_dynamics\_parameter\_estimation\_friction.py} 中验证与调试输出。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{动力学模型：刚体 + 摩擦}
+%==============================================================================
+
+\subsection{关节力矩的分解}
+
+在含关节摩擦的模型中，关节力矩可写为``刚体动力学''与``摩擦''两部分之和：
+\begin{equation}
+  \bm{\tau} = \bm{\tau}_{\mathrm{rigid}} + \bm{\tau}_{\mathrm{fric}},
+  \label{eq:tau_split}
+\end{equation}
+其中
+\begin{itemize}[leftmargin=*]
+  \item $\bm{\tau}_{\mathrm{rigid}}$：仅由惯性参数（质量、质心、惯量）和运动状态 $(\bm{q},\dot{\bm{q}},\ddot{\bm{q}})$ 决定，与速度符号、粘滞等无关，称为\textbf{刚性部分}；
+  \item $\bm{\tau}_{\mathrm{fric}}$：摩擦转矩，本程序采用模型 $\tau_{\mathrm{fric},j} = F_{v,j}\,\dot{q}_j + F_{c,j}\,\mathrm{sign}(\dot{q}_j)$（粘滞 + 库仑）。
+\end{itemize}
+
+\subsection{刚性部分的线性回归形式}
+
+刚体动力学关于一组动力学参数 $\bm{\theta}\in\mathbb{R}^{n_{\mathrm{params}}}$（$n_{\mathrm{params}}=70$）是线性的，可写成
+\begin{equation}
+  \bm{\tau}_{\mathrm{rigid}} = Y(\bm{q},\dot{\bm{q}},\ddot{\bm{q}})\,\bm{\theta}.
+  \label{eq:rigid_Y_theta}
+\end{equation}
+$Y\in\mathbb{R}^{7\times 70}$ 为关节力矩回归矩阵（由 Pinocchio 的 \texttt{computeJointTorqueRegressor} 得到），与文档 05 中约定一致。因此：
+\begin{equation}
+  \bm{\tau} = Y(\bm{q},\dot{\bm{q}},\ddot{\bm{q}})\,\bm{\theta} + \bm{\tau}_{\mathrm{fric}},
+  \label{eq:tau_full}
+\end{equation}
+其中摩擦项可写成与参数 $F_v,\,F_c\in\mathbb{R}^7$ 的线性形式（见下节）。
+
+\subsection{摩擦项的线性化与扩展回归}
+
+令 $\bm{v}=\dot{\bm{q}}$。摩擦模型为逐关节：
+\[
+\tau_{\mathrm{fric},j} = F_{v,j}\,v_j + F_{c,j}\,\mathrm{sign}(v_j),\quad j=1,\ldots,7.
+\]
+定义 $D_v = \mathrm{diag}(v_1,\ldots,v_7)$，$D_{\mathrm{sign}} = \mathrm{diag}(\mathrm{sign}(v_1),\ldots,\mathrm{sign}(v_7))$，则
+\[
+\bm{\tau}_{\mathrm{fric}} = D_v\,\bm{F}_v + D_{\mathrm{sign}}\,\bm{F}_c.
+\]
+将 $\bm{\theta}$、$\bm{F}_v$、$\bm{F}_c$ 拼成扩展参数向量
+\begin{equation}
+  \bm{\varphi} = \begin{bmatrix} \bm{\theta} \\ \bm{F}_v \\ \bm{F}_c \end{bmatrix} \in \mathbb{R}^{70+7+7},
+  \label{eq:phi}
+\end{equation}
+并定义扩展回归矩阵（每样本 $7\times 84$）
+\begin{equation}
+  W = \bigl[\, Y \,\big|\, D_v \,\big|\, D_{\mathrm{sign}} \,\bigr],
+  \label{eq:W}
+\end{equation}
+则
+\begin{equation}
+  \bm{\tau} = W\,\bm{\varphi} = Y\,\bm{\theta} + D_v\,\bm{F}_v + D_{\mathrm{sign}}\,\bm{F}_c.
+  \label{eq:tau_W_phi}
+\end{equation}
+式 \eqref{eq:tau_W_phi} 中，\textbf{刚性部分}即 $Y\,\bm{\theta}$，\textbf{摩擦部分}即 $D_v\,\bm{F}_v + D_{\mathrm{sign}}\,\bm{F}_c$。
+
+%==============================================================================
+\section{Ridge 求解与``未投影''参数 \texorpdfstring{$\bm{\varphi}$}{φ}}
+%==============================================================================
+
+\subsection{扩展最小二乘与正则化}
+
+对全部样本堆叠得到 $W_{\mathrm{all}}$、$\bm{\tau}_{\mathrm{all}}$，Ridge 求解
+\begin{equation}
+  \bm{\varphi} = \arg\min_{\bm{\varphi}} \ \bigl\| W_{\mathrm{all}}\,\bm{\varphi} - \bm{\tau}_{\mathrm{all}} \bigr\|^2 + \bm{\varphi}^\top \Lambda \,\bm{\varphi} + \text{（先验项）},
+  \label{eq:ridge}
+\end{equation}
+得到 $\bm{\varphi}$，其中前 $70$ 维记为
+\begin{equation}
+  \bm{\theta}_{\mathrm{ridge}} = \bm{\varphi}_{1:70}.
+  \label{eq:theta_ridge}
+\end{equation}
+$\bm{\theta}_{\mathrm{ridge}}$ 是纯代数意义下的最优参数，\textbf{未}施加质量、惯量正定性等物理约束，因此可能非物理（如负质量、非正定惯量）。
+
+\subsection{预测力矩与``刚性部分''的第一次出现}
+
+由式 \eqref{eq:tau_W_phi}，对验证集上某一样本，回归给出的预测力矩为
+\begin{equation}
+  \widehat{\bm{\tau}} = W\,\bm{\varphi} = \underbrace{Y\,\bm{\theta}_{\mathrm{ridge}}}_{\text{刚性部分}} + \underbrace{D_v\,\bm{F}_v + D_{\mathrm{sign}}\,\bm{F}_c}_{\text{摩擦部分}}.
+  \label{eq:tau_hat_ridge}
+\end{equation}
+这里``刚性部分''明确为
+\begin{equation}
+  \boxed{\ \bm{\tau}_{\mathrm{rigid}}^{(\varphi)} = Y\,\bm{\theta}_{\mathrm{ridge}} = Y\,\bm{\varphi}_{1:70}.\ }
+  \label{eq:rigid_ridge}
+\end{equation}
+即：\textbf{用 Ridge 解中的前 70 维参数}与回归矩阵 $Y$ 相乘得到的刚体转矩。
+
+%==============================================================================
+\section{物理投影与``投影后''参数 \texorpdfstring{$\bm{\theta}_{\mathrm{est}}$}{θ\_est}}
+%==============================================================================
+
+\subsection{为何要做物理投影}
+
+URDF 与仿真/控制中需要的是物理可行的惯性参数（质量 $>0$，惯量矩阵正定等）。因此程序对 $\bm{\theta}_{\mathrm{ridge}}$ 做一次\textbf{物理投影}（如带质量/惯量约束的 QP 或最近可行点），得到
+\begin{equation}
+  \bm{\theta}_{\mathrm{est}} = \mathrm{Project}(\bm{\theta}_{\mathrm{ridge}}).
+  \label{eq:theta_est}
+\end{equation}
+$\bm{\theta}_{\mathrm{est}}$ 写入 URDF，并用于 RNEA 逆动力学等。一般有
+\begin{equation}
+  \bm{\theta}_{\mathrm{est}} \neq \bm{\theta}_{\mathrm{ridge}}.
+  \label{eq:theta_diff}
+\end{equation}
+
+\subsection{``刚性部分''的第二次出现：表格中的 Y*\texorpdfstring{$\bm{\theta}$}{θ}}
+
+验证时，程序用\textbf{同一}回归矩阵 $Y$（由辨识后的 URDF 对应的 model 计算），但用\textbf{投影后}参数计算``无摩擦预测''：
+\begin{equation}
+  \text{（表格中的）}\quad Y\!\ast\!\bm{\theta} \ =\ Y\,\bm{\theta}_{\mathrm{est}}.
+  \label{eq:Y_theta_display}
+\end{equation}
+因此，这是\textbf{第二种刚性部分}：
+\begin{equation}
+  \boxed{\ \bm{\tau}_{\mathrm{rigid}}^{(\mathrm{est})} = Y\,\bm{\theta}_{\mathrm{est}}.\ }
+  \label{eq:rigid_est}
+\end{equation}
+它与式 \eqref{eq:rigid_ridge} 的区别仅在于：一个用 $\bm{\varphi}_{1:70}$，一个用 $\bm{\theta}_{\mathrm{est}}$。由于 $\bm{\theta}_{\mathrm{ridge}}\neq\bm{\theta}_{\mathrm{est}}$，所以
+\[
+Y\,\bm{\theta}_{\mathrm{ridge}} \neq Y\,\bm{\theta}_{\mathrm{est}}.
+\]
+
+%==============================================================================
+\section{两种``摩擦''与刚性差}
+%==============================================================================
+
+\subsection{回归的``带摩擦预测''始终用 \texorpdfstring{$\bm{\varphi}$}{φ}}
+
+程序里``Y*$\bm{\theta}$+摩擦''对应的数值来自扩展回归的预测，即
+\begin{equation}
+  \text{Y*}\bm{\theta}\text{+摩擦} \ =\ W\,\bm{\varphi} = Y\,\bm{\theta}_{\mathrm{ridge}} + \text{（摩擦项）}.
+  \label{eq:Y_theta_plus_fric}
+\end{equation}
+摩擦项在回归中的形式为 $D_v\,\bm{F}_v + D_{\mathrm{sign}}\,\bm{F}_c$，即
+\begin{equation}
+  \bm{\tau}_{\mathrm{fric}}^{(\mathrm{pure})} = D_v\,\bm{F}_v + D_{\mathrm{sign}}\,\bm{F}_c.
+  \label{eq:fric_pure}
+\end{equation}
+因此有恒等式
+\begin{equation}
+  W\,\bm{\varphi} = Y\,\bm{\theta}_{\mathrm{ridge}} + \bm{\tau}_{\mathrm{fric}}^{(\mathrm{pure})}.
+  \label{eq:W_phi_decomp}
+\end{equation}
+
+\subsection{摩擦\_纯(Y) 的定义}
+
+在程序中，``摩擦\_纯(Y)''定义为回归预测与\textbf{用同一组 $\bm{\theta}$（Ridge）}算出的刚性部分之差，即
+\begin{equation}
+  \boxed{\ \text{摩擦\_纯(Y)} = W\,\bm{\varphi} - Y\,\bm{\theta}_{\mathrm{ridge}} = \bm{\tau}_{\mathrm{fric}}^{(\mathrm{pure})}.\ }
+  \label{eq:fric_pure_def}
+\end{equation}
+因此摩擦\_纯(Y) 就是回归中的\textbf{纯摩擦项}，与式 \eqref{eq:fric_pure} 一致，理论上等于 $F_v\,\dot{q}_j + F_c\,\mathrm{sign}(\dot{q}_j)$ 按关节组成的向量。
+
+\subsection{摩擦(Y*\texorpdfstring{$\bm{\theta}$}{θ}) 的定义与刚性差}
+
+表格中的``Y*$\bm{\theta}$''取为 $Y\,\bm{\theta}_{\mathrm{est}}$（见 \eqref{eq:Y_theta_display}），所以程序定义
+\begin{equation}
+  \text{摩擦(Y*}\bm{\theta}\text{)} = \text{(Y*}\bm{\theta}\text{+摩擦)} - \text{(Y*}\bm{\theta}\text{)} = W\,\bm{\varphi} - Y\,\bm{\theta}_{\mathrm{est}}.
+  \label{eq:fric_Y_theta_def}
+\end{equation}
+将 $W\,\bm{\varphi}$ 用式 \eqref{eq:W_phi_decomp} 代入：
+\begin{align}
+  \text{摩擦(Y*}\bm{\theta}\text{)} &= Y\,\bm{\theta}_{\mathrm{ridge}} + \bm{\tau}_{\mathrm{fric}}^{(\mathrm{pure})} - Y\,\bm{\theta}_{\mathrm{est}} \notag \\
+  &= \underbrace{\bm{\tau}_{\mathrm{fric}}^{(\mathrm{pure})}}_{\text{摩擦\_纯(Y)}} + \underbrace{Y\,(\bm{\theta}_{\mathrm{ridge}} - \bm{\theta}_{\mathrm{est}})}_{\text{刚性差}}.
+  \label{eq:fric_Y_theta_split}
+\end{align}
+因此定义\textbf{刚性差}为
+\begin{equation}
+  \boxed{\ \text{刚性差} = Y\,(\bm{\theta}_{\mathrm{ridge}} - \bm{\theta}_{\mathrm{est}}) = Y\,(\bm{\varphi}_{1:70} - \bm{\theta}_{\mathrm{est}}).\ }
+  \label{eq:rigid_diff_def}
+\end{equation}
+它是：\textbf{用``Ridge 参数''与``投影参数''分别代入同一回归矩阵 $Y$ 得到的刚性转矩之差}。因为 $Y$ 是线性的，所以这个差就是 $Y$ 作用在参数差 $(\bm{\theta}_{\mathrm{ridge}} - \bm{\theta}_{\mathrm{est}})$ 上。
+
+\subsection{小结：三个量的关系}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{摩擦\_纯(Y)}：回归中真正的摩擦项，$W\bm{\varphi} - Y\bm{\theta}_{\mathrm{ridge}}$，等于 $D_v\bm{F}_v + D_{\mathrm{sign}}\bm{F}_c$。
+  \item \textbf{摩擦(Y*$\bm{\theta}$)}：表格中``带摩擦预测''减``表格中 Y*$\bm{\theta}$''，即 $W\bm{\varphi} - Y\bm{\theta}_{\mathrm{est}}$，等于 摩擦\_纯(Y) + 刚性差。
+  \item \textbf{刚性差}：$Y(\bm{\theta}_{\mathrm{ridge}} - \bm{\theta}_{\mathrm{est}})$，来源于物理投影改变了参数，从而改变了``刚性部分''的数值。
+\end{itemize}
+
+%==============================================================================
+\section{程序中的符号对应}
+%==============================================================================
+
+\begin{table}[h]
+  \centering
+  \caption{符号与程序变量对应}
+  \begin{tabular}{cl}
+    \toprule
+    符号 & 程序中的变量或含义 \\
+    \midrule
+    $\bm{\varphi}$ & \texttt{phi}（Ridge 解，84 维） \\
+    $\bm{\theta}_{\mathrm{ridge}} = \bm{\varphi}_{1:70}$ & \texttt{phi[:n\_params]} \\
+    $\bm{\theta}_{\mathrm{est}}$ & \texttt{theta\_estimated}（投影后，写 URDF） \\
+    $W\,\bm{\varphi}$ & \texttt{tau\_val\_pred} / ``Y*$\bm{\theta}$+摩擦'' \\
+    $Y\,\bm{\theta}_{\mathrm{ridge}}$ & \texttt{Y\_val @ phi[:n\_params]} \\
+    $Y\,\bm{\theta}_{\mathrm{est}}$ & \texttt{tau\_val\_pred\_no\_fric} / ``Y*$\bm{\theta}$'' \\
+    摩擦\_纯(Y) & \texttt{fric\_pure\_Y\_2d} \\
+    摩擦(Y*$\bm{\theta}$) & \texttt{fric\_Y\_2d} \\
+    刚性差 & $Y\,(\texttt{phi[:n\_params]} - \texttt{theta\_estimated})$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+%==============================================================================
+\section{总结}
+%==============================================================================
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{刚性部分}：指关节力矩中由 $Y\bm{\theta}$ 给出的部分，只依赖惯性参数和 $(q,\dot{q},\ddot{q})$，不包含摩擦模型。
+  \item 程序中出现两种刚性部分，是因为存在两套参数：Ridge 的 $\bm{\varphi}_{1:70}$ 与投影后的 $\bm{\theta}_{\mathrm{est}}$；前者用于 $W\bm{\varphi}$，后者用于写 URDF 和表格中的``Y*$\bm{\theta}$''。
+  \item \textbf{刚性差} = $Y(\bm{\theta}_{\mathrm{ridge}} - \bm{\theta}_{\mathrm{est}})$，是这两套参数在同一 $Y$ 下得到的刚性转矩之差；它不是 URDF 中的一个参数，而是验证时的一个导出量。
+  \item ``摩擦(Y*$\bm{\theta}$)'' 比 ``摩擦\_纯(Y)'' 多出的部分就是刚性差，因此若希望两者一致，需在验证时对``无摩擦预测''也使用 $\bm{\theta}_{\mathrm{ridge}}$（即 $Y\bm{\varphi}_{1:70}$）再减，从而得到摩擦\_纯(Y)。
+\end{enumerate}
+
+\end{document}

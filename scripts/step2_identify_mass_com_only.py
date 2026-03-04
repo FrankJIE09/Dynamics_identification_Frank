@@ -27,9 +27,15 @@ from step2_partial_common import (
     setup_for_partial_identification,
     write_result_csvs_and_urdf,
     run_validation,
+    check_inertia_positive_definite,
 )
 
 OUTPUT_URDF_BASENAME = "AR5-5_07R-W4C4A2_identified_mass_com_only.urdf"
+
+# 参数（直接在本文件中设置，不通过 config 导入）
+LAMBDA_REL = 1e-2
+M_MIN = 1e-4
+I_EPS = 1e-6
 
 # 每连杆 10 维中只辨识前 4 个: indices 0,1,2,3, 10,11,12,13, ...
 def _mass_com_column_indices(n_links: int) -> list[int]:
@@ -75,8 +81,8 @@ def main():
     fixed_inds = [i for i in range(n_params) if i not in col_inds]
     tau_resid = tau_all - Y_all[:, fixed_inds] @ theta_urdf[fixed_inds]
     x_prior = theta_urdf[col_inds]
-    lam = float(cfg.get("lambda_rel", 1e-2)) * (np.trace(Y_mc.T @ Y_mc) / max(len(col_inds), 1))
-    m_min = float(cfg.get("m_min", 1e-4))
+    lam = LAMBDA_REL * (np.trace(Y_mc.T @ Y_mc) / max(len(col_inds), 1))
+    m_min = M_MIN
     n_mc = len(col_inds)
     # 带先验: min ||Y_mc@x - tau_resid||^2 + lam*||x - x_prior||^2，避免 (m,mc) 偏离 URDF 过远
     P = 2.0 * (Y_mc.T @ Y_mc + lam * np.eye(n_mc))
@@ -121,6 +127,7 @@ def main():
     tau_pred = Y_all @ theta_estimated
     rmse = np.sqrt(np.mean((tau_all - tau_pred) ** 2))
     result_summary = f"部分辨识(仅质量与质心)\n惯量用 URDF，辨识 (m,mc) 每连杆 4 维\nRMSE(tau): {rmse:.6e}\n"
+    cfg["I_eps"] = I_EPS
     write_result_csvs_and_urdf(
         out,
         theta_estimated,
@@ -135,6 +142,7 @@ def main():
         result_summary=result_summary,
     )
     run_validation(out, collected, theta_estimated, Fv, Fc, n_params, n_joints, urdf_file)
+    check_inertia_positive_definite(theta_estimated, n_links)
     print(f"\n  完成。输出 URDF: {out['output_urdf']}")
 
 

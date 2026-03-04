@@ -33,9 +33,16 @@ from step2_partial_common import (
     setup_for_partial_identification,
     write_result_csvs_and_urdf,
     run_validation,
+    check_inertia_positive_definite,
 )
 
 OUTPUT_URDF_BASENAME = "AR5-5_07R-W4C4A2_identified_friction_mass_com.urdf"
+
+# 参数（直接在本文件中设置，不通过 config 导入）
+LAMBDA_REL = 1e-2
+LAM_FRICTION = 1e-8
+M_MIN = 1e-4
+I_EPS = 1e-6
 
 
 def _mass_com_column_indices(n_links: int) -> list[int]:
@@ -87,8 +94,8 @@ def main():
     n_mc = len(col_inds)
     n_x = n_mc + n_frict
 
-    lam_mc = float(cfg.get("lambda_rel", 1e-2)) * (np.trace(Y_mc.T @ Y_mc) / max(n_mc, 1))
-    lam_frict = float(cfg.get("lam_friction", 1e-8))
+    lam_mc = LAMBDA_REL * (np.trace(Y_mc.T @ Y_mc) / max(n_mc, 1))
+    lam_frict = LAM_FRICTION
     L_diag = np.ones(n_x)
     L_diag[:n_mc] = lam_mc
     L_diag[n_mc:] = lam_frict
@@ -97,7 +104,7 @@ def main():
 
     P = 2.0 * (W_ext.T @ W_ext + np.diag(L_diag))
     q = -2.0 * (W_ext.T @ tau_resid + L_diag * x_prior)
-    m_min = float(cfg.get("m_min", 1e-4))
+    m_min = M_MIN
 
     if OSQP_AVAILABLE and n_links == 7:
         # 约束: x[4*j] >= m_min (7), x[n_mc+j] >= 0 (Fv), x[n_mc+n_joints+j] >= 0 (Fc)
@@ -161,6 +168,7 @@ def main():
         "惯量用 URDF，辨识 (m,mc)+Fv/Fc，约束 m≥m_min, Fv≥0, Fc≥0\n"
         f"RMSE(tau): {rmse:.6e}\n"
     )
+    cfg["I_eps"] = I_EPS
     write_result_csvs_and_urdf(
         out,
         theta_estimated,
@@ -175,6 +183,7 @@ def main():
         result_summary=result_summary,
     )
     run_validation(out, collected, theta_estimated, Fv, Fc, n_params, n_joints, urdf_file)
+    check_inertia_positive_definite(theta_estimated, n_links)
     print(f"\n  完成。输出 URDF: {out['output_urdf']}")
 
 
