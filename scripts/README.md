@@ -45,10 +45,10 @@ python scripts/step2_dynamics_parameter_estimation.py
 
 # 指定配置与数据、URDF
 python scripts/step2_dynamics_parameter_estimation.py --config src/config/step2_dynamics_parameter_estimation.yaml
-python scripts/step2_dynamics_parameter_estimation.py config/dynamics_identification_data.csv urdf/AR5-5_07R-W4C4A2_Manual_fix.urdf
+python scripts/step2_dynamics_parameter_estimation.py config/dynamics_identification_data.csv scripts/AR5-5_07R-W4C4A2/AR5-5_07R-W4C4A2.urdf
 
 # 与 C++ 结果一致：调用 C++ 可执行文件做辨识（需先编译 C++ 工程）
-python scripts/step2_dynamics_parameter_estimation.py --use-cpp src/config/dynamics_identification_data.csv urdf/AR5-5_07R-W4C4A2_Manual_fix.urdf
+python scripts/step2_dynamics_parameter_estimation.py --use-cpp src/config/dynamics_identification_data.csv scripts/AR5-5_07R-W4C4A2/AR5-5_07R-W4C4A2.urdf
 ```
 
 ## 输入

@@ -2,9 +2,7 @@
 """
 Step2 动力学参数辨识（含摩擦）- Python 版
 模型: τ = Y(q,dq,ddq)*θ + Fv*dq + Fc*sign(dq)，其中 Fv/Fc 为 7 维（每关节粘滞/库伦系数）。
-流程：读配置 → 加载 URDF 与 CSV → 构造 W=[Y,D_visc,D_coul]、tau → 用 QP+约束（质量 θ[10j]>=m_min）
-求解 φ=[θ,Fv,Fc]（无约束时则 Ridge 求解再投影）→ 输出结果、摩擦系数与 URDF → 验证集验证。
-QP 分支下同一行得到 φ 且 θ 已满足质量约束，无需后验投影，刚性差从根上避免。
+流程：读配置 → 加载 URDF 与 CSV → 构造扩展回归矩阵 W=[Y,D_visc,D_coul]、tau → Ridge 求解 φ=[θ,Fv,Fc] → 物理投影 θ → 输出结果、摩擦系数与 URDF → 验证集验证。
 """
 
 from __future__ import annotations
@@ -65,7 +63,7 @@ def load_config(config_path: str | None) -> dict:
     cfg = {
         "data_file": "../src/config/dynamics_identification_data.csv",
         "urdf_file": "scripts/AR5-5_07R-W4C4A2/AR5-5_07R-W4C4A2.urdf",
-        "lambda_rel": 1e-2,
+        "lambda_rel": 10000,
         "lam_friction": 1e-8,
         "m_min": 1e-4,
         "I_eps": 1e-6,
@@ -221,12 +219,6 @@ def project_theta_to_physical(
 
 
 # ---------- QP 求解（OSQP）----------
-# 目标与约束与代码一一对应（无摩擦版，仅 θ）：
-#   min_θ   (1/2)||Y θ - τ||^2 + (λ/2)||θ - θ_urdf||^2
-#   =>  (1/2) θ'(Y'Y + λI)θ - (Y'τ + λ θ_urdf)'θ + const
-#   =>  H = 2(Y'Y + λI),  g = -2(Y'τ + λ θ_urdf)   [OSQP: min (1/2)x'Px + q'x]
-# 约束（与 project_theta_to_physical 中质量约束一致）：
-#   θ[10*j] >= m_min  (j=0..n_links-1)  =>  -θ[10*j] <= -m_min  =>  A[j, 10*j]=-1, l[j]=-∞, u[j]=-m_min
 def solve_ridge_qp(
     Y_all: np.ndarray,
     tau_all: np.ndarray,
@@ -251,55 +243,10 @@ def solve_ridge_qp(
     P = sparse.csc_matrix(H)
     A_sp = sparse.csc_matrix(A)
     m = osqp.OSQP()
-    m.setup(P=P, q=g, A=A_sp, l=l, u=u, verbose=False, polish=True)
+    m.setup(P=P, q=g, A=A_sp, l=l, u=u, verbose=False, polish=True,
+            eps_abs=1e-12,   # 绝对容差，比默认 1e-3 更严
+            eps_rel=1e-6,  ) # 相对容差
     r = m.solve()
-    if r.info.status not in ("solved", "solved inaccurate"):
-        return None
-    return r.x
-
-
-def solve_ridge_qp_friction(
-    W_all: np.ndarray,
-    tau_all: np.ndarray,
-    phi_prior: np.ndarray,
-    L_diag: np.ndarray,
-    n_params: int,
-    n_links: int,
-    m_min: float,
-) -> np.ndarray | None:
-    """用 QP+约束 一次得到 φ=[θ,Fv,Fc]，θ 已满足质量约束，无需后验投影，刚性差从根上避免。
-
-    目标函数（与无约束 Ridge 一致，对应原 A_reg @ phi = b_reg 的解）：
-        min_φ   (1/2)||W φ - τ||^2 + (1/2) Σ_i L_diag[i] (φ[i] - φ_prior[i])^2
-    展开为二次型：
-        (1/2) φ'(W'W + diag(L_diag)) φ - (W'τ + diag(L_diag) φ_prior)' φ + const
-    OSQP 标准形 min (1/2)x'Px + q'x，对应：
-        P = 2 * (W_all.T @ W_all + np.diag(L_diag))   # 代码中 H
-        q = -2 * (W_all.T @ tau_all + L_diag * phi_prior)   # 代码中 g
-
-    约束（仅对 θ 部分，与 project_theta_to_physical 中质量约束一致；惯量 I_eps/三角不等为非线性，此处仅加质量）：
-        θ[10*j] >= m_min  (j=0..n_links-1)
-    OSQP 形式 l <= A φ <= u：令 -θ[10*j] <= -m_min
-        A[j, 10*j] = -1，其余为 0；l[j]=-np.inf，u[j]=-m_min
-    """
-    if not OSQP_AVAILABLE or n_links <= 0 or n_params != 10 * n_links:
-        return None
-    n_phi = phi_prior.size
-    if W_all.shape[1] != n_phi or W_all.shape[0] != tau_all.size or L_diag.size != n_phi:
-        return None
-    H = 2.0 * (W_all.T @ W_all + np.diag(L_diag))
-    g = -2.0 * (W_all.T @ tau_all + L_diag * phi_prior)
-    # 约束: 只对 θ 前 n_params 维，θ[10*j] >= m_min => A[j, 10*j]=-1, l=-inf, u=-m_min
-    A = np.zeros((n_links, n_phi))
-    for j in range(n_links):
-        A[j, 10 * j] = -1.0
-    l = np.full(n_links, -1e30)
-    u = np.full(n_links, -m_min)
-    P = sparse.csc_matrix(H)
-    A_sp = sparse.csc_matrix(A)
-    prob = osqp.OSQP()
-    prob.setup(P=P, q=g, A=A_sp, l=l, u=u, verbose=False, polish=True)
-    r = prob.solve()
     if r.info.status not in ("solved", "solved inaccurate"):
         return None
     return r.x
@@ -535,7 +482,6 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
     W_all = np.vstack(W_list)
     tau_all = np.concatenate(tau_list)
     n_phi = n_params + n_friction
-    n_links = n_params // 10
     print(f"\n  回归矩阵构造完成 维度: Y {Y_all.shape[0]} x {Y_all.shape[1]}, W(含摩擦) {W_all.shape[0]} x {W_all.shape[1]}, tau: {tau_all.size}")
 
     # 保存 Y_all 到二进制文件，便于与 C++ 对比（格式: int32 rows, int32 cols, row-major float64）
@@ -576,38 +522,24 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
     L_diag = np.ones(n_phi) * lam_friction
     L_diag[:n_params] = lam
 
-    # 用 QP+约束 一次得到 φ，θ 满足质量约束，无需后验投影，刚性差从根上避免
-    use_qp = (
-        OSQP_AVAILABLE
-        and n_params == 70
-        and theta_urdf.size == n_params
-        and n_links == 7
-    )
-    if use_qp:
-        phi = solve_ridge_qp_friction(
-            W_all, tau_all, phi_prior, L_diag, n_params, n_links, m_min
-        )
-    if not use_qp or phi is None:
-        A_reg = W_all.T @ W_all + np.diag(L_diag)
-        b_reg = W_all.T @ tau_all + np.diag(L_diag) @ phi_prior
-        phi = np.linalg.solve(A_reg, b_reg)
-        print(f"  使用 Ridge 无约束求解 φ=[θ,Fv,Fc]: lambda_rel={lambda_rel}, lam_friction={lam_friction:.2e}")
-    else:
-        print(f"  使用 QP+Ridge（质量约束 θ[10j]>=m_min）求解 φ=[θ,Fv,Fc]: lambda_rel={lambda_rel}, lam_friction={lam_friction:.2e}，无需投影")
+    A_reg = W_all.T @ W_all + np.diag(L_diag)
+    b_reg = W_all.T @ tau_all + np.diag(L_diag) @ phi_prior
+    phi = np.linalg.solve(A_reg, b_reg)
+    print(f"  使用 Ridge 求解 φ=[θ,Fv,Fc]: lambda_rel={lambda_rel}, lam_friction={lam_friction:.2e}")
 
-    theta_estimated = np.asarray(phi[:n_params], dtype=np.float64).copy()
+    theta_estimated = np.asarray(phi[:n_params], dtype=np.float64).copy()  # 与 φ[0:70] 一致，不做投影
     Fv = np.asarray(phi[n_params : n_params + n_joints], dtype=np.float64)
     Fc = np.asarray(phi[n_params + n_joints : n_phi], dtype=np.float64)
     theta_ls_ridge = theta_estimated.copy()
 
-    # QP 已含质量约束，不再做 project_theta_to_physical，避免投影带来的刚性差
-    if not use_qp and n_params == 70 and theta_urdf.size == n_params:
-        fallback = theta_urdf
-        project_theta_to_physical(
-            theta_estimated, n_params, cfg["m_min"], cfg["I_eps"],
-            theta_urdf_fallback=fallback, I_trace_min=cfg["I_trace_min"],
-        )
-        print("  已应用物理约束投影（无约束求解分支）")
+    # 不做物理投影，保持 theta_estimated = phi[0:70]（若需投影可取消下方注释）
+    # if n_params == 70 and theta_urdf.size == n_params:
+    #     fallback = theta_urdf
+    #     project_theta_to_physical(
+    #         theta_estimated, n_params, cfg["m_min"], cfg["I_eps"],
+    #         theta_urdf_fallback=fallback, I_trace_min=cfg["I_trace_min"],
+    #     )
+    #     print("  已应用物理约束投影")
 
     # 训练集误差（Y*θ + 摩擦）
     tau_pred = W_all @ phi

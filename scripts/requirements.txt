@@ -4,3 +4,4 @@
 numpy>=1.20
 PyYAML>=5.1
 osqp>=0.6  # 可选：用于带质量约束的 QP 求解
+cvxpy>=1.4  # 可选：用于 SDP 惯量约束（step2_dynamics_parameter_estimation_friction_sdp.py）

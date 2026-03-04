@@ -2,9 +2,7 @@
 """
 Step2 动力学参数辨识（含摩擦）- Python 版
 模型: τ = Y(q,dq,ddq)*θ + Fv*dq + Fc*sign(dq)，其中 Fv/Fc 为 7 维（每关节粘滞/库伦系数）。
-流程：读配置 → 加载 URDF 与 CSV → 构造 W=[Y,D_visc,D_coul]、tau → 用 QP+约束（质量 θ[10j]>=m_min）
-求解 φ=[θ,Fv,Fc]（无约束时则 Ridge 求解再投影）→ 输出结果、摩擦系数与 URDF → 验证集验证。
-QP 分支下同一行得到 φ 且 θ 已满足质量约束，无需后验投影，刚性差从根上避免。
+流程：读配置 → 加载 URDF 与 CSV → 构造扩展回归矩阵 W=[Y,D_visc,D_coul]、tau → Ridge 求解 φ=[θ,Fv,Fc] → 物理投影 θ → 输出结果、摩擦系数与 URDF → 验证集验证。
 """
 
 from __future__ import annotations
@@ -221,12 +219,6 @@ def project_theta_to_physical(
 
 
 # ---------- QP 求解（OSQP）----------
-# 目标与约束与代码一一对应（无摩擦版，仅 θ）：
-#   min_θ   (1/2)||Y θ - τ||^2 + (λ/2)||θ - θ_urdf||^2
-#   =>  (1/2) θ'(Y'Y + λI)θ - (Y'τ + λ θ_urdf)'θ + const
-#   =>  H = 2(Y'Y + λI),  g = -2(Y'τ + λ θ_urdf)   [OSQP: min (1/2)x'Px + q'x]
-# 约束（与 project_theta_to_physical 中质量约束一致）：
-#   θ[10*j] >= m_min  (j=0..n_links-1)  =>  -θ[10*j] <= -m_min  =>  A[j, 10*j]=-1, l[j]=-∞, u[j]=-m_min
 def solve_ridge_qp(
     Y_all: np.ndarray,
     tau_all: np.ndarray,
@@ -253,53 +245,6 @@ def solve_ridge_qp(
     m = osqp.OSQP()
     m.setup(P=P, q=g, A=A_sp, l=l, u=u, verbose=False, polish=True)
     r = m.solve()
-    if r.info.status not in ("solved", "solved inaccurate"):
-        return None
-    return r.x
-
-
-def solve_ridge_qp_friction(
-    W_all: np.ndarray,
-    tau_all: np.ndarray,
-    phi_prior: np.ndarray,
-    L_diag: np.ndarray,
-    n_params: int,
-    n_links: int,
-    m_min: float,
-) -> np.ndarray | None:
-    """用 QP+约束 一次得到 φ=[θ,Fv,Fc]，θ 已满足质量约束，无需后验投影，刚性差从根上避免。
-
-    目标函数（与无约束 Ridge 一致，对应原 A_reg @ phi = b_reg 的解）：
-        min_φ   (1/2)||W φ - τ||^2 + (1/2) Σ_i L_diag[i] (φ[i] - φ_prior[i])^2
-    展开为二次型：
-        (1/2) φ'(W'W + diag(L_diag)) φ - (W'τ + diag(L_diag) φ_prior)' φ + const
-    OSQP 标准形 min (1/2)x'Px + q'x，对应：
-        P = 2 * (W_all.T @ W_all + np.diag(L_diag))   # 代码中 H
-        q = -2 * (W_all.T @ tau_all + L_diag * phi_prior)   # 代码中 g
-
-    约束（仅对 θ 部分，与 project_theta_to_physical 中质量约束一致；惯量 I_eps/三角不等为非线性，此处仅加质量）：
-        θ[10*j] >= m_min  (j=0..n_links-1)
-    OSQP 形式 l <= A φ <= u：令 -θ[10*j] <= -m_min
-        A[j, 10*j] = -1，其余为 0；l[j]=-np.inf，u[j]=-m_min
-    """
-    if not OSQP_AVAILABLE or n_links <= 0 or n_params != 10 * n_links:
-        return None
-    n_phi = phi_prior.size
-    if W_all.shape[1] != n_phi or W_all.shape[0] != tau_all.size or L_diag.size != n_phi:
-        return None
-    H = 2.0 * (W_all.T @ W_all + np.diag(L_diag))
-    g = -2.0 * (W_all.T @ tau_all + L_diag * phi_prior)
-    # 约束: 只对 θ 前 n_params 维，θ[10*j] >= m_min => A[j, 10*j]=-1, l=-inf, u=-m_min
-    A = np.zeros((n_links, n_phi))
-    for j in range(n_links):
-        A[j, 10 * j] = -1.0
-    l = np.full(n_links, -1e30)
-    u = np.full(n_links, -m_min)
-    P = sparse.csc_matrix(H)
-    A_sp = sparse.csc_matrix(A)
-    prob = osqp.OSQP()
-    prob.setup(P=P, q=g, A=A_sp, l=l, u=u, verbose=False, polish=True)
-    r = prob.solve()
     if r.info.status not in ("solved", "solved inaccurate"):
         return None
     return r.x
@@ -535,7 +480,6 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
     W_all = np.vstack(W_list)
     tau_all = np.concatenate(tau_list)
     n_phi = n_params + n_friction
-    n_links = n_params // 10
     print(f"\n  回归矩阵构造完成 维度: Y {Y_all.shape[0]} x {Y_all.shape[1]}, W(含摩擦) {W_all.shape[0]} x {W_all.shape[1]}, tau: {tau_all.size}")
 
     # 保存 Y_all 到二进制文件，便于与 C++ 对比（格式: int32 rows, int32 cols, row-major float64）
@@ -576,38 +520,31 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
     L_diag = np.ones(n_phi) * lam_friction
     L_diag[:n_params] = lam
 
-    # 用 QP+约束 一次得到 φ，θ 满足质量约束，无需后验投影，刚性差从根上避免
-    use_qp = (
-        OSQP_AVAILABLE
-        and n_params == 70
-        and theta_urdf.size == n_params
-        and n_links == 7
-    )
-    if use_qp:
-        phi = solve_ridge_qp_friction(
-            W_all, tau_all, phi_prior, L_diag, n_params, n_links, m_min
-        )
-    if not use_qp or phi is None:
-        A_reg = W_all.T @ W_all + np.diag(L_diag)
-        b_reg = W_all.T @ tau_all + np.diag(L_diag) @ phi_prior
-        phi = np.linalg.solve(A_reg, b_reg)
-        print(f"  使用 Ridge 无约束求解 φ=[θ,Fv,Fc]: lambda_rel={lambda_rel}, lam_friction={lam_friction:.2e}")
-    else:
-        print(f"  使用 QP+Ridge（质量约束 θ[10j]>=m_min）求解 φ=[θ,Fv,Fc]: lambda_rel={lambda_rel}, lam_friction={lam_friction:.2e}，无需投影")
+    A_reg = W_all.T @ W_all + np.diag(L_diag)
+    b_reg = W_all.T @ tau_all + np.diag(L_diag) @ phi_prior
+    phi = np.linalg.solve(A_reg, b_reg)
+    print(f"  使用 Ridge 求解 φ=[θ,Fv,Fc]: lambda_rel={lambda_rel}, lam_friction={lam_friction:.2e}")
 
     theta_estimated = np.asarray(phi[:n_params], dtype=np.float64).copy()
     Fv = np.asarray(phi[n_params : n_params + n_joints], dtype=np.float64)
     Fc = np.asarray(phi[n_params + n_joints : n_phi], dtype=np.float64)
     theta_ls_ridge = theta_estimated.copy()
 
-    # QP 已含质量约束，不再做 project_theta_to_physical，避免投影带来的刚性差
-    if not use_qp and n_params == 70 and theta_urdf.size == n_params:
-        fallback = theta_urdf
-        project_theta_to_physical(
-            theta_estimated, n_params, cfg["m_min"], cfg["I_eps"],
-            theta_urdf_fallback=fallback, I_trace_min=cfg["I_trace_min"],
-        )
-        print("  已应用物理约束投影（无约束求解分支）")
+    # 打印辨识前后 theta 及它们的差（投影前：theta_estimated = Ridge 解）
+    if theta_urdf.size == n_params and theta_urdf.size == theta_estimated.size:
+        diff_theta = theta_estimated - theta_urdf
+        max_diff = np.max(np.abs(diff_theta))
+        mean_diff = np.mean(np.abs(diff_theta))
+        n_links_theta = n_params // 10
+        print("\n  [辨识前后 θ，投影前] theta_urdf(初始URDF) vs theta_estimated(Ridge解) 差: 最大={:.6e}, 平均={:.6e}".format(max_diff, mean_diff))
+        for j in range(n_links_theta):
+            base = 10 * j
+            d = diff_theta[base : base + 10]
+            max_j = np.max(np.abs(d))
+            link_name = _joint_name_to_link_name(model.names[j + 1]) if j + 1 < model.njoints else f"link{j}"
+            print("    连杆{} ({}): |差|_max={:.6e}  [m差={:.4e} mc差={:.4e},{:.4e},{:.4e} I^o差={:.4e},{:.4e},{:.4e}]".format(
+                j, link_name, max_j,
+                d[0], d[1], d[2], d[3], d[4], d[6], d[9]))
 
     # 训练集误差（Y*θ + 摩擦）
     tau_pred = W_all @ phi
@@ -642,6 +579,15 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
         f.write("\n辨识的 θ 值:\n")
         for i in range(len(theta_estimated)):
             f.write(f"  theta[{i}] = {theta_estimated[i]:.6e}\n")
+        if theta_urdf.size == n_params and theta_urdf.size == theta_estimated.size:
+            diff_theta = theta_estimated - theta_urdf
+            f.write("\n[辨识前后 θ] theta_urdf(初始URDF) vs theta_estimated(辨识后) 差:\n")
+            f.write("  最大={:.6e} 平均={:.6e}\n".format(np.max(np.abs(diff_theta)), np.mean(np.abs(diff_theta))))
+            for j in range(n_params // 10):
+                base = 10 * j
+                d = diff_theta[base : base + 10]
+                link_name = _joint_name_to_link_name(model.names[j + 1]) if j + 1 < model.njoints else "link{}".format(j)
+                f.write("  连杆{} {} |差|_max={:.6e}\n".format(j, link_name, np.max(np.abs(d))))
     print(f"  结果已保存到: {result_path}")
 
     for name, arr in [
@@ -969,6 +915,33 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
                 dq_2d = np.array([W_val[s * 7 + j, 70 + j] for s in range(n_val) for j in range(7)]).reshape(n_val, 7)
                 sign_dq_2d = np.array([W_val[s * 7 + j, 77 + j] for s in range(n_val) for j in range(7)]).reshape(n_val, 7)
                 v_2d_rnea = np.array(v_list[:n_val]) if len(v_list) >= n_val else np.zeros((n_val, 7))
+                # 原URDF 的计算结果：Y(原)*θ_urdf 与 rnea(原)
+                tau_Y_orig_2d = None
+                tau_rnea_orig_2d = None
+                if theta_urdf.size == n_params:
+                    try:
+                        model_orig, data_orig = build_model_and_data(urdf_file)
+                        tau_Y_orig_list = []
+                        tau_rnea_orig_list = []
+                        for s in range(n_val):
+                            point = collected[validation_start + s]
+                            q = np.array(point["q"], dtype=np.float64)
+                            v = np.array(point["dq"], dtype=np.float64)
+                            a = np.array(point["ddq"], dtype=np.float64)
+                            pin.computeJointTorqueRegressor(model_orig, data_orig, q, v, a)
+                            Y_row = np.asarray(data_orig.jointTorqueRegressor)
+                            if Y_row.shape[1] == n_params:
+                                tau_Y_s = Y_row @ theta_urdf
+                            else:
+                                tau_Y_s = np.zeros(7)
+                            tau_rnea_s = np.array(pin.rnea(model_orig, data_orig, q, v, a))
+                            for j in range(7):
+                                tau_Y_orig_list.append(float(tau_Y_s[j]))
+                                tau_rnea_orig_list.append(float(tau_rnea_s[j]))
+                        tau_Y_orig_2d = np.array(tau_Y_orig_list).reshape(n_val, 7)
+                        tau_rnea_orig_2d = np.array(tau_rnea_orig_list).reshape(n_val, 7)
+                    except Exception as _e:
+                        pass
                 fric_Y_2d = tau_Yfric_2d - tau_Y_2d  # (Y*θ+摩擦)-Y*θ，含刚性差
                 fric_rnea_2d = tau_rnea_fric_2d - tau_rnea_2d  # Fv*v+Fc*sign(v)
                 fric_diff_2d = fric_Y_2d - fric_rnea_2d
@@ -978,11 +951,14 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
                 print("  摩擦系数 (辨识): Fv = " + " ".join(f"J{j}={Fv[j]:.6f}" for j in range(7)))
                 print("  摩擦系数 (辨识): Fc = " + " ".join(f"J{j}={Fc[j]:.6f}" for j in range(7)))
                 print("  前 3 个验证样本 τ [Nm]:")
+                has_orig = tau_Y_orig_2d is not None and tau_rnea_orig_2d is not None
+                header_extra = " | Y*θ(原) | rnea(原)" if has_orig else ""
                 for s in range(min(3, n_val)):
                     print(f"    样本{s}:  sign(dq) = " + " ".join(f"J{j}={sign_dq_2d[s,j]:7.3f}" for j in range(7)))
-                    print(f"            实测   | Y*θ   |Y*θ+摩擦|摩擦(Y*θ)|摩擦_纯(Y)| dq(Y) | rnea  |rnea+摩擦|摩擦(rnea)|rnea+摩擦(Y路)| v(rnea)|摩擦差")
+                    print(f"            实测   | Y*θ   |Y*θ+摩擦|摩擦(Y*θ)|摩擦_纯(Y)| dq(Y) | rnea  |rnea+摩擦|摩擦(rnea)|rnea+摩擦(Y路)| v(rnea)|摩擦差{header_extra}")
                     for j in range(7):
-                        print(f"      关节{j}: {tau_meas_2d[s,j]:6.2f} | {tau_Y_2d[s,j]:6.2f} | {tau_Yfric_2d[s,j]:6.2f} | {fric_Y_2d[s,j]:7.2f} | {fric_pure_Y_2d[s,j]:7.2f} | {dq_2d[s,j]:6.3f} | {tau_rnea_2d[s,j]:6.2f} | {tau_rnea_fric_2d[s,j]:6.2f} | {fric_rnea_2d[s,j]:7.2f} | {tau_rnea_plus_fric_Y_2d[s,j]:6.2f} | {v_2d_rnea[s,j]:6.3f} | {fric_diff_2d[s,j]:7.2f}")
+                        row_extra = f" | {tau_Y_orig_2d[s,j]:6.2f} | {tau_rnea_orig_2d[s,j]:6.2f}" if has_orig else ""
+                        print(f"      关节{j}: {tau_meas_2d[s,j]:6.2f} | {tau_Y_2d[s,j]:6.2f} | {tau_Yfric_2d[s,j]:6.2f} | {fric_Y_2d[s,j]:7.2f} | {fric_pure_Y_2d[s,j]:7.2f} | {dq_2d[s,j]:6.3f} | {tau_rnea_2d[s,j]:6.2f} | {tau_rnea_fric_2d[s,j]:6.2f} | {fric_rnea_2d[s,j]:7.2f} | {tau_rnea_plus_fric_Y_2d[s,j]:6.2f} | {v_2d_rnea[s,j]:6.3f} | {fric_diff_2d[s,j]:7.2f}{row_extra}")
                 with open(out["result_file"], "a", encoding="utf-8") as f:
                     f.write("\n[调试] Y*θ+摩擦 vs 辨识URDF[COM]+rnea+摩擦\n")
                     f.write("  φ[:n_params]与theta_estimated差 最大={:.6e} 均值={:.6e}\n".format(np.max(theta_diff), np.mean(theta_diff)))
@@ -994,12 +970,13 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
                     f.write("  两预测差 最大/关节: " + " ".join(f"J{j}={max_abs_diff_per_j[j]:.6f}" for j in range(7)) + "\n")
                     f.write("  摩擦系数 Fv: " + " ".join(f"J{j}={Fv[j]:.6f}" for j in range(7)) + "\n")
                     f.write("  摩擦系数 Fc: " + " ".join(f"J{j}={Fc[j]:.6f}" for j in range(7)) + "\n")
-                    f.write("  前3样本 实测|Y*θ|Y*θ+摩擦|摩擦(Y*θ)|摩擦_纯(Y)|rnea|rnea+摩擦|rnea+摩擦(Y路):\n")
+                    f.write("  前3样本 实测|Y*θ|Y*θ+摩擦|摩擦(Y*θ)|摩擦_纯(Y)|rnea|rnea+摩擦|rnea+摩擦(Y路)|Y*θ(原)|rnea(原):\n")
                     for s in range(min(3, n_val)):
                         f.write(f"  样本{s} dq(Y): " + " ".join(f"J{j}={dq_2d[s,j]:.6f}" for j in range(7)) + "\n")
                         f.write(f"  样本{s} v(rnea): " + " ".join(f"J{j}={v_2d_rnea[s,j]:.6f}" for j in range(7)) + "\n")
                         for j in range(7):
-                            f.write(f"    关节{j}: {tau_meas_2d[s,j]:.4f} {tau_Y_2d[s,j]:.4f} {tau_Yfric_2d[s,j]:.4f} {fric_Y_2d[s,j]:.4f} {fric_pure_Y_2d[s,j]:.4f} {tau_rnea_2d[s,j]:.4f} {tau_rnea_fric_2d[s,j]:.4f} {tau_rnea_plus_fric_Y_2d[s,j]:.4f}\n")
+                            orig_str = f" {tau_Y_orig_2d[s,j]:.4f} {tau_rnea_orig_2d[s,j]:.4f}" if has_orig else ""
+                            f.write(f"    关节{j}: {tau_meas_2d[s,j]:.4f} {tau_Y_2d[s,j]:.4f} {tau_Yfric_2d[s,j]:.4f} {fric_Y_2d[s,j]:.4f} {fric_pure_Y_2d[s,j]:.4f} {tau_rnea_2d[s,j]:.4f} {tau_rnea_fric_2d[s,j]:.4f} {tau_rnea_plus_fric_Y_2d[s,j]:.4f}{orig_str}\n")
     except Exception as e:
         print(f"  (提示) 使用辨识URDF[COM]进行验证时出错: {e}")
 

@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Step2 动力学参数辨识（含摩擦）- Python 版
+Step2 动力学参数辨识（含摩擦）- Python 版（2 次优化：QP + I_com 约束）
 模型: τ = Y(q,dq,ddq)*θ + Fv*dq + Fc*sign(dq)，其中 Fv/Fc 为 7 维（每关节粘滞/库伦系数）。
-流程：读配置 → 加载 URDF 与 CSV → 构造 W=[Y,D_visc,D_coul]、tau → 用 QP+约束（质量 θ[10j]>=m_min）
-求解 φ=[θ,Fv,Fc]（无约束时则 Ridge 求解再投影）→ 输出结果、摩擦系数与 URDF → 验证集验证。
-QP 分支下同一行得到 φ 且 θ 已满足质量约束，无需后验投影，刚性差从根上避免。
+流程：读配置 → 加载 URDF 与 CSV → 构造 W=[Y,D_visc,D_coul]、tau →
+优先用 2 次优化（use_i_com_constraint=True 且 CVXPY 可用时）：
+  第 1 次 QP（仅质量约束）得 φ1 → 第 2 次 SDP（质量 + 质心惯量 I_com 正定 LMI 约束），先验=φ1，得到 φ。
+否则第 2 次退化为：对 θ 投影后第 2 次 QP。再否则单次 QP 或 Ridge+投影。
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -48,6 +50,13 @@ try:
 except ImportError:
     OSQP_AVAILABLE = False
 
+try:
+    import cvxpy as cp
+    CVXPY_AVAILABLE = True
+except ImportError:
+    CVXPY_AVAILABLE = False
+    cp = None
+
 
 # ---------- 配置 ----------
 def _find_config_path():
@@ -64,12 +73,15 @@ def _find_config_path():
 def load_config(config_path: str | None) -> dict:
     cfg = {
         "data_file": "../src/config/dynamics_identification_data.csv",
-        "urdf_file": "scripts/AR5-5_07R-W4C4A2/AR5-5_07R-W4C4A2.urdf",
+        "urdf_file": "../urdf/AR5-5_07R-W4C4A2_Manual_fix.urdf",
         "lambda_rel": 1e-2,
         "lam_friction": 1e-8,
         "m_min": 1e-4,
         "I_eps": 1e-6,
         "I_trace_min": 1e-3,
+        "use_sdp_inertia": False,
+        "use_two_stage_qp": True,
+        "use_i_com_constraint": True,
         "output_dir": "data_output",
         "result_file": "dynamics_identification_results.txt",
         "dynamics_parameters_csv": "dynamics_parameters.csv",
@@ -101,6 +113,12 @@ def load_config(config_path: str | None) -> dict:
                     try:
                         if key in ("lambda_rel", "lam_friction", "m_min", "I_eps", "I_trace_min"):
                             cfg[key] = float(val)
+                        elif key == "use_sdp_inertia":
+                            cfg[key] = str(val).strip().lower() in ("true", "1", "yes")
+                        elif key == "use_two_stage_qp":
+                            cfg[key] = str(val).strip().lower() in ("true", "1", "yes")
+                        elif key == "use_i_com_constraint":
+                            cfg[key] = str(val).strip().lower() in ("true", "1", "yes")
                         else:
                             cfg[key] = val
                     except ValueError:
@@ -305,6 +323,253 @@ def solve_ridge_qp_friction(
     return r.x
 
 
+def solve_ridge_two_stage_qp_friction(
+    W_all: np.ndarray,
+    tau_all: np.ndarray,
+    phi_prior: np.ndarray,
+    L_diag: np.ndarray,
+    n_params: int,
+    n_links: int,
+    m_min: float,
+    I_eps: float,
+    I_trace_min: float,
+    theta_urdf_fallback: np.ndarray | None,
+    use_i_com_constraint: bool = True,
+) -> tuple[np.ndarray | None, bool]:
+    """2 次优化：第 1 次 QP（质量约束）得 φ1；第 2 次用约束保证 I_com 正定（不做投影）。
+    - use_i_com_constraint=True 且 CVXPY 可用：第 2 次为 SDP（质量 + 质心惯量 I_com 正定 LMI），先验 φ_prior=φ1。
+    - 否则：第 2 次为 QP（对 θ 做关节处惯量投影后以投影为先验再拟合），I_com 不保证正定。
+    返回 (phi, used_i_com_constraint)。
+    """
+    if not OSQP_AVAILABLE or n_links <= 0 or n_params != 10 * n_links:
+        return (None, False)
+    n_phi = phi_prior.size
+    if W_all.shape[1] != n_phi or W_all.shape[0] != tau_all.size or L_diag.size != n_phi:
+        return (None, False)
+    # 第 1 次 QP：仅质量约束
+    phi1 = solve_ridge_qp_friction(
+        W_all, tau_all, phi_prior, L_diag, n_params, n_links, m_min
+    )
+    if phi1 is None:
+        return (None, False)
+    # 第 2 次：用约束保证 I_com 正定（SDP），不做投影
+    if use_i_com_constraint and CVXPY_AVAILABLE:
+        phi2, used_i_com = solve_ridge_sdp_friction(
+            W_all, tau_all, phi1, L_diag, n_params, n_links, m_min,
+            I_eps, I_trace_min,
+        )
+        if phi2 is not None:
+            return (phi2, used_i_com)
+        # SDP 失败则回退到投影+第2次QP
+    # 回退：对 θ 做物理投影后第 2 次 QP（不保证 I_com 正定）
+    theta1 = np.asarray(phi1[:n_params], dtype=np.float64).copy()
+    project_theta_to_physical(
+        theta1, n_params, m_min, I_eps,
+        theta_urdf_fallback=theta_urdf_fallback,
+        I_trace_min=I_trace_min,
+    )
+    phi_prior2 = np.concatenate([theta1, phi1[n_params:]])
+    phi2 = solve_ridge_qp_friction(
+        W_all, tau_all, phi_prior2, L_diag, n_params, n_links, m_min
+    )
+    return (phi2, False)
+
+
+def solve_ridge_sdp_friction(
+    W_all: np.ndarray,
+    tau_all: np.ndarray,
+    phi_prior: np.ndarray,
+    L_diag: np.ndarray,
+    n_params: int,
+    n_links: int,
+    m_min: float,
+    I_eps: float,
+    I_trace_min: float,
+) -> tuple[np.ndarray | None, bool]:
+    """方案 C：用 SDP 约束质量 + 质心处惯量 I_com 正定，一次求解 φ=[θ,Fv,Fc]。
+    返回 (phi.value 或 None, used_i_com_constraint)：第二项为 True 表示使用了 I_com 正定约束，False 表示仅用 fallback（质量约束）。
+
+    目标函数（Ridge + 先验）：
+        min_φ   (1/2)||W φ - τ||^2 + (1/2) Σ_i L_diag[i] (φ[i] - φ_prior[i])^2
+    其中 W = [Y, D_visc, D_coul]，φ = [θ(70), Fv(7), Fc(7)]，τ 为实测力矩堆叠。
+
+    约束（仅对动力学参数物理性，关节处 I^o 不约束）：
+        (1) 质量下界：对每连杆 j，θ[10*j] = m_j >= m_min。
+        (2) 质心处惯量正定：对每连杆 j，I_com_j >> I_eps*I_3。
+            I_com = I^o - (1/m)*((mc·mc)*I - mc⊗mc)，质心 c = mc/m（与优化变量一致）。
+            该约束对 (m, mc, I^o) 非线性（含 inv_pos(m) 与 mc 的二次项），在 CVXPY 的 DCP 规则下
+            PSD 约束要求仿射表达式，故可能被拒绝；若求解失败则回退为仅质量约束，写 URDF 前再对 I_com 投影。
+        I_com 的三角不等式与 trace 下界未在 SDP 中施加，由 generate_identified_urdf_com 写前投影保证。
+
+    参数：
+        W_all: 扩展回归矩阵 (n_samples*7, n_phi)，每行对应某样本某关节的 W 行。
+        tau_all: 实测力矩堆叠 (n_samples*7,)。
+        phi_prior: 先验 φ，通常 θ 部分为 URDF 的 toDynamicParameters，摩擦部分为 0。
+        L_diag: 正则化对角 (n_phi,)，θ 部分用 lambda_rel 相关量，摩擦部分用 lam_friction。
+        n_params: θ 维数，应为 10*n_links（如 70）。
+        n_links: 连杆数（如 7）。
+        m_min: 质量下界（kg）。
+        I_eps: 惯量正定最小特征值下界（kg·m²）。
+        I_trace_min: 未在本次 SDP 中使用，保留接口兼容；写 URDF 前投影或 fallback 投影时可能用到。
+
+    返回：
+        (phi_value, used_i_com): 成功时 phi_value 为 (n_phi,)，used_i_com 表示是否施加了 I_com 约束；失败时 (None, False)。
+    """
+    # ---------- 前置检查 ----------
+    if not CVXPY_AVAILABLE or n_links <= 0 or n_params != 10 * n_links:
+        return (None, False)
+    n_phi = phi_prior.size
+    if W_all.shape[1] != n_phi or W_all.shape[0] != tau_all.size or L_diag.size != n_phi:
+        return (None, False)
+
+    # ---------- 决策变量 ----------
+    phi = cp.Variable(n_phi)  # [θ(70), Fv(7), Fc(7)]，θ 每 10 维为 [m, mc_x, mc_y, mc_z, I^o_xx, I^o_xy, I^o_yy, I^o_xz, I^o_yz, I^o_zz]
+
+    # ---------- 目标：Ridge 拟合 + 先验正则 ----------
+    obj = 0.5 * cp.sum_squares(W_all @ phi - tau_all) + 0.5 * cp.sum(
+        cp.multiply(L_diag, cp.square(phi - phi_prior))
+    )
+
+    # ---------- 约束 1：质量下界（每连杆） ----------
+    constraints = []
+    for j in range(n_links):
+        constraints.append(phi[10 * j] >= m_min)
+
+    # ---------- 约束 2：质心处惯量相关正定（每连杆），用 Schur 补写成仿射 LMI ----------
+    # I_com = I^o - (1/m)*((mc·mc)*I - mc⊗mc)。直接写 I_com >> I_eps*I 含 inv_pos(m)*二次项，非仿射，DCP 不通过。
+    # 用 Schur 补：[[ I^o - I_eps*I, mc ], [ mc', m ]] >> 0  <=> (m>0 且) I^o - (1/m)*mc*mc' >> I_eps*I。
+    # 该 4x4 对 (m, mc, I^o) 为仿射，故为 DCP。与 I_com>>I_eps*I 不等价（I_com 多减 (1/m)*(mc·mc)*I），
+    # 但为常用 LMI 松弛；写 URDF 前仍会对 I_com 做投影/三角不等式等。
+    constraints_com = []
+    for j in range(n_links):
+        b = 10 * j
+        m_j = phi[b]                                    # 质量
+        mc0, mc1, mc2 = phi[b + 1], phi[b + 2], phi[b + 3]  # 一阶矩 mc
+        # 绕关节原点的惯量 3x3（Pinocchio 10D 顺序 4,5,6,7,8,9 => (0,0),(0,1),(1,1),(0,2),(1,2),(2,2)）
+        I_o = cp.bmat([
+            [phi[b + 4], phi[b + 5], phi[b + 7]],
+            [phi[b + 5], phi[b + 6], phi[b + 8]],
+            [phi[b + 7], phi[b + 8], phi[b + 9]],
+        ])
+        # 仿射块矩阵 4x4：[[ I^o - I_eps*I_3, mc ], [ mc', m ]]，PSD 等价于 I^o - (1/m)*mc*mc' >> I_eps*I
+        I_o_shifted = I_o - I_eps * np.eye(3)
+        mc_col = cp.reshape(cp.hstack([mc0, mc1, mc2]), (3, 1))
+        # 4x4: 左上 3x3 = I_o_shifted，右上 3x1 = mc_col，左下 1x3 = mc_col.T，右下 1x1 = m_j
+        block_4x4 = cp.bmat([
+            [I_o_shifted, mc_col],
+            [mc_col.T, cp.reshape(m_j, (1, 1))],
+        ])
+        constraints_com.append(block_4x4 >> 0)
+
+    # ---------- 打印约束与问题规模 ----------
+    all_constraints = constraints + constraints_com
+    print("  [SDP] 变量: n_phi={} (θ={}, Fv+Fc={})".format(n_phi, n_params, n_phi - n_params))
+    print("  [SDP] 约束: 质量下界 {} 个 (phi[10*j]>=m_min), 惯量 LMI {} 个 (4x4 Schur I^o-(1/m)mc*mc'>>I_eps*I), 共 {} 个".format(
+        len(constraints), len(constraints_com), len(all_constraints)))
+    print("  [SDP] 目标: min (1/2)||W*φ-τ||^2 + (1/2)*L_diag*(φ-φ_prior)^2")
+
+    # ---------- 求解：先带 I_com 约束 ----------
+    prob = cp.Problem(cp.Minimize(obj), constraints + constraints_com)  # 目标 + 质量下界 + I_com 正定
+    try:
+        print("  [SDP] 问题 DCP 检查: {}".format(prob.is_dcp()))
+    except Exception as e:
+        print("  [SDP] 问题 DCP 检查: 异常 ({})".format(e))
+    ok = False
+    print("  [SDP] 正在求解 (质量 + I_com 正定)...")
+    try:
+        prob.solve(solver=cp.SCS, verbose=True)
+        if hasattr(prob, 'solver_stats') and prob.solver_stats is not None:
+            t_solve = getattr(prob.solver_stats, 'solve_time', None)
+            if t_solve is not None:
+                print("  [SDP] 求解耗时: {:.3f} s".format(t_solve))
+        print("  [SDP] 求解状态: {}".format(prob.status))
+        if prob.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+            ok = True
+    except Exception as e:
+        print("  [SDP] 求解异常: {}".format(e))
+    if ok:
+        return (phi.value, True)  # 成功且使用了 I_com 约束
+
+    # ---------- Fallback：仅质量约束 ----------
+    # I_com 约束可能因 DCP 或求解器失败；退化为只约束质量
+    print("  [SDP] I_com 约束求解未成功，改用仅质量约束 (fallback)")
+    prob_fallback = cp.Problem(cp.Minimize(obj), constraints)  # 仅质量下界，无 I_com
+    try:
+        prob_fallback.solve(solver=cp.SCS, verbose=True)
+        if hasattr(prob_fallback, 'solver_stats') and prob_fallback.solver_stats is not None:
+            t_solve = getattr(prob_fallback.solver_stats, 'solve_time', None)
+            if t_solve is not None:
+                print("  [SDP] Fallback 求解耗时: {:.3f} s".format(t_solve))
+        print("  [SDP] Fallback 求解状态: {}".format(prob_fallback.status))
+        if prob_fallback.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+            return (None, False)
+        return (phi.value, False)  # 成功但未使用 I_com，仅质量约束
+    except Exception as e:
+        print("  [SDP] Fallback 求解异常: {}".format(e))
+        return (None, False)
+
+
+# ---------- URDF 解析（用于对比初始文件与 Pinocchio 读入）----------
+def _parse_urdf_inertials(urdf_path: str) -> dict:
+    """从 URDF 文件中解析每个 link 的 <inertial>：mass, origin xyz, inertia 6 元。
+    返回 dict: link_name -> {'mass': float, 'xyz': (x,y,z), 'ixx','iyy','izz','ixy','ixz','iyz': float}
+    若某 link 无 inertial 或解析失败则无该项。
+    """
+    result = {}
+    if not os.path.isfile(urdf_path):
+        return result
+    with open(urdf_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    # 找所有 <link name="..."> 与紧随其后的 <inertial>...</inertial>
+    link_pattern = re.compile(r'<link\s+name="([^"]+)"[^>]*>')
+    mass_pattern = re.compile(r'<mass\s+value="([^"]+)"')
+    origin_pattern = re.compile(r'<origin[^>]*xyz="([^"]+)"')
+    inertia_pattern = re.compile(
+        r'<inertia\s+ixx="([^"]+)"\s+ixy="([^"]+)"\s+ixz="([^"]+)"\s+iyy="([^"]+)"\s+iyz="([^"]+)"\s+izz="([^"]+)"'
+    )
+    pos = 0
+    while True:
+        m_link = link_pattern.search(content, pos)
+        if not m_link:
+            break
+        link_name = m_link.group(1)
+        start = m_link.end()
+        # 只在本 link 块内找 </inertial>（到下一个 <link 之前）
+        next_link = link_pattern.search(content, start)
+        search_end = next_link.start() if next_link else len(content)
+        end_inertial = content.find("</inertial>", start, search_end)
+        if end_inertial == -1:
+            pos = start
+            continue
+        block = content[start : end_inertial + len("</inertial>")]
+        # 只在 <inertial> 段内解析，避免用到 visual/collision 的 origin
+        inertial_start = block.find("<inertial>")
+        sub = block[inertial_start:] if inertial_start >= 0 else block
+        mass_m = mass_pattern.search(sub)
+        origin_m = origin_pattern.search(sub)
+        inertia_m = inertia_pattern.search(sub)
+        try:
+            entry = {}
+            if mass_m:
+                entry["mass"] = float(mass_m.group(1))
+            if origin_m:
+                xyz_str = origin_m.group(1).split()
+                entry["xyz"] = (float(xyz_str[0]), float(xyz_str[1]), float(xyz_str[2])) if len(xyz_str) >= 3 else (0, 0, 0)
+            if inertia_m:
+                entry["ixx"] = float(inertia_m.group(1))
+                entry["ixy"] = float(inertia_m.group(2))
+                entry["ixz"] = float(inertia_m.group(3))
+                entry["iyy"] = float(inertia_m.group(4))
+                entry["iyz"] = float(inertia_m.group(5))
+                entry["izz"] = float(inertia_m.group(6))
+            if "mass" in entry and "xyz" in entry and "ixx" in entry:
+                result[link_name] = entry
+        except (ValueError, IndexError):
+            pass
+        pos = end_inertial + 1
+    return result
+
+
 # ---------- URDF 生成 ----------
 def _joint_name_to_link_name(joint_name: str) -> str:
     if "joint_" in joint_name:
@@ -313,7 +578,9 @@ def _joint_name_to_link_name(joint_name: str) -> str:
 
 
 def _inertia_origin_to_com(I_3x3: np.ndarray, m: float, c: np.ndarray) -> np.ndarray:
-    """从绕 link 原点的惯量 I_origin 得到绕质心的惯量 I_com。I_com = I_origin - m * ( (c·c)*E - c⊗c )。"""
+    """从绕 link 原点的惯量 I_origin 得到绕质心的惯量 I_com。
+    平行轴: I_com = I_origin - m * ( (c·c)*E - c⊗c )，c 为质心在 link 系下坐标。
+    """
     c = np.asarray(c, dtype=float).ravel()[:3]
     r2 = float(np.dot(c, c))
     return I_3x3 - m * (r2 * np.eye(3) - np.outer(c, c))
@@ -365,22 +632,35 @@ def generate_identified_urdf_com(
     theta_estimated: np.ndarray,
     Fv: np.ndarray | None = None,
     Fc: np.ndarray | None = None,
+    I_eps: float = 1e-6,
 ) -> None:
-    """质心处惯量：<inertia> 写 I_com，<origin xyz> 为质心。theta 的 4:9 为 toDynamicParameters 的 I^o（绕原点），写入前换算为 I_com。"""
+    """质心处惯量：<inertia> 写 I_com，<origin xyz> 为质心；若提供 Fv/Fc 则写入关节 <dynamics>。
+    theta_estimated 的 4:9 为 toDynamicParameters 的 I^o（绕原点），写入 URDF 时换算为 I_com。
+    不再在函数内对 I_com 做投影，不修改 theta_estimated，完全沿用调用方传入的 θ。"""
     with open(original_urdf_file, "r", encoding="utf-8") as f:
         lines = f.readlines()
     n_inertial = min(7, theta_estimated.size // 10)
+
     link_inertial = {}
     for j in range(n_inertial):
         jid = j + 1
         base = 10 * j
         pi_id = theta_estimated[base : base + 10]
+        # theta/toDynamicParameters: [m,mcx,mcy,mcz, I^o_xx,I^o_xy,I^o_yy,I^o_xz,I^o_yz,I^o_zz]，I^o=绕 link 原点
         m_id = float(pi_id[0])
         c_id = np.array([pi_id[1] / max(pi_id[0], 1e-12), pi_id[2] / max(pi_id[0], 1e-12), pi_id[3] / max(pi_id[0], 1e-12)])
-        I_origin = np.array([[pi_id[4], pi_id[5], pi_id[7]], [pi_id[5], pi_id[6], pi_id[8]], [pi_id[7], pi_id[8], pi_id[9]]], dtype=float)
+        I_origin = np.array([
+            [pi_id[4], pi_id[5], pi_id[7]],
+            [pi_id[5], pi_id[6], pi_id[8]],
+            [pi_id[7], pi_id[8], pi_id[9]],
+        ], dtype=float)
         I_com = _inertia_origin_to_com(I_origin, m_id, c_id)
-        ixx, ixy, ixz = float(I_com[0, 0]), float(I_com[0, 1]), float(I_com[0, 2])
-        iyy, iyz, izz = float(I_com[1, 1]), float(I_com[1, 2]), float(I_com[2, 2])
+        ixx = float(I_com[0, 0])
+        ixy = float(I_com[0, 1])
+        ixz = float(I_com[0, 2])
+        iyy = float(I_com[1, 1])
+        iyz = float(I_com[1, 2])
+        izz = float(I_com[2, 2])
         joint_name = model.names[jid]
         link_name = _joint_name_to_link_name(joint_name)
         blk = (
@@ -393,6 +673,7 @@ def generate_identified_urdf_com(
         link_inertial[link_name] = blk
         if "AR5-5" not in link_name and "link" in link_name:
             link_inertial["AR5-5_07R-W4C4A2_" + link_name] = blk
+        print(f"    [URDF 写入] 连杆{j} ({link_name}): m={m_id:.6f}, I_com: Ixx={ixx:.6e}, Iyy={iyy:.6e}, Izz={izz:.6e}, com=({c_id[0]:.6f},{c_id[1]:.6f},{c_id[2]:.6f})")
 
     joint_friction = {}
     if Fv is not None and Fc is not None and Fv.size >= 7 and Fc.size >= 7:
@@ -450,6 +731,41 @@ def generate_identified_urdf_com(
         f.writelines(out_lines)
     print(f"  已生成新的URDF文件(质心处惯量+摩擦): {output_urdf_file}")
 
+    # 写后校验：URDF 中写的是 I_com，用 theta_estimated 换算的 I_com 与读回值对比
+    try:
+        with open(output_urdf_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        idx = content.find('AR5-5_07R-W4C4A2_link1')
+        if idx != -1:
+            idx_inertia = content.find("<inertia ", idx)
+            if idx_inertia != -1:
+                end = content.find("/>", idx_inertia) + 2
+                line = content[idx_inertia:end]
+                ixx_u = re.search(r'ixx="([^"]+)"', line)
+                iyy_u = re.search(r'iyy="([^"]+)"', line)
+                izz_u = re.search(r'izz="([^"]+)"', line)
+                if ixx_u and iyy_u and izz_u:
+                    ixx_read = float(ixx_u.group(1))
+                    iyy_read = float(iyy_u.group(1))
+                    izz_read = float(izz_u.group(1))
+                    # link0: 由 theta_estimated 的 I^o 换算为 I_com
+                    pi0 = theta_estimated[:10]
+                    m0 = pi0[0]
+                    c0 = np.array([pi0[1] / max(m0, 1e-12), pi0[2] / max(m0, 1e-12), pi0[3] / max(m0, 1e-12)])
+                    I_o0 = np.array([[pi0[4], pi0[5], pi0[7]], [pi0[5], pi0[6], pi0[8]], [pi0[7], pi0[8], pi0[9]]], dtype=float)
+                    I_com0 = _inertia_origin_to_com(I_o0, m0, c0)
+                    ixx_com = float(I_com0[0, 0])
+                    iyy_com = float(I_com0[1, 1])
+                    izz_com = float(I_com0[2, 2])
+                    print(f"  [写后校验] URDF 中 link1 惯量(I_com): ixx={ixx_read:.6e}, iyy={iyy_read:.6e}, izz={izz_read:.6e}")
+                    print(f"  [写后校验] 由 theta_estimated 换算的 I_com(link0): ixx={ixx_com:.6e}, iyy={iyy_com:.6e}, izz={izz_com:.6e}")
+                    if abs(ixx_read - ixx_com) < 1e-5 and abs(iyy_read - iyy_com) < 1e-5 and abs(izz_read - izz_com) < 1e-5:
+                        print("  [写后校验] 一致")
+                    else:
+                        print("  [写后校验] 不一致，请检查")
+    except Exception as e:
+        print(f"  [写后校验] 读回 URDF 失败: {e}")
+
 
 # ---------- 主流程 ----------
 def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> None:
@@ -489,11 +805,34 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
     theta_urdf = np.zeros(n_params)
     expected_params = 10 * (model.njoints - 1)
     if n_params == expected_params:
+        # toDynamicParameters 返回 [m, mc_x, mc_y, mc_z, I^o_xx, I^o_xy, I^o_yy, I^o_xz, I^o_yz, I^o_zz]，I^o=绕 link 原点
         for jid in range(1, model.njoints):
             pi = np.array(model.inertias[jid].toDynamicParameters()).ravel()
             base = 10 * (jid - 1)
             theta_urdf[base : base + 10] = pi
-        print(f"  已构造URDF先验theta_urdf（维度 {theta_urdf.size}）")
+        print(f"  已构造URDF先验theta_urdf（维度 {theta_urdf.size}，惯量部分为 I^o 绕原点）")
+
+        # 初始 URDF 文件中的数据 vs Pinocchio 加载该 URDF 后 toDynamicParameters() 得到的数据
+        urdf_abs = os.path.abspath(urdf_file) if urdf_file else ""
+        parsed = _parse_urdf_inertials(urdf_abs) if urdf_abs else {}
+        n_links_print = min(7, (model.njoints - 1))
+        print("\n  [初始 URDF] 文件中解析的 <inertial> vs Pinocchio 加载后 toDynamicParameters()（I^o=绕原点）:")
+        for jid in range(1, 1 + n_links_print):
+            link_name = _joint_name_to_link_name(model.names[jid])
+            base = 10 * (jid - 1)
+            pin_m = theta_urdf[base]
+            pin_c = (theta_urdf[base + 1] / max(pin_m, 1e-12), theta_urdf[base + 2] / max(pin_m, 1e-12), theta_urdf[base + 3] / max(pin_m, 1e-12))
+            pin_Ixx, pin_Iyy, pin_Izz = theta_urdf[base + 4], theta_urdf[base + 6], theta_urdf[base + 9]
+            file_d = parsed.get(link_name) or {}
+            if file_d:
+                print("    连杆{} ({}) 文件: m={:.6e} xyz=({:.6e},{:.6e},{:.6e}) Ixx={:.6e} Iyy={:.6e} Izz={:.6e}".format(
+                    jid - 1, link_name, file_d.get("mass", 0), file_d.get("xyz", (0, 0, 0))[0], file_d.get("xyz", (0, 0, 0))[1], file_d.get("xyz", (0, 0, 0))[2],
+                    file_d.get("ixx", 0), file_d.get("iyy", 0), file_d.get("izz", 0)))
+                print("              Pinocchio: m={:.6e} com=({:.6e},{:.6e},{:.6e}) I^o_xx,yy,zz={:.6e},{:.6e},{:.6e}".format(
+                    pin_m, pin_c[0], pin_c[1], pin_c[2], pin_Ixx, pin_Iyy, pin_Izz))
+            else:
+                print("    连杆{} ({}) 文件中未解析到 inertial | Pinocchio: m={:.6e} com=({:.6e},{:.6e},{:.6e}) I^o_xx,yy,zz={:.6e},{:.6e},{:.6e}".format(
+                    jid - 1, link_name, pin_m, pin_c[0], pin_c[1], pin_c[2], pin_Ixx, pin_Iyy, pin_Izz))
     else:
         theta_urdf = np.array([])
         print("  警告: n_params != 10*(njoints-1)，无法构造URDF先验")
@@ -555,6 +894,44 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
             f.write(str(i) + "," + ",".join(f"{x:.17g}" for x in row) + "\n")
     print(f"  Y_all 输入数据已保存到: {_y_input_csv}")
 
+    # 辨识前：由 theta_urdf 计算每连杆 I_com，与 URDF 文件中的惯量（即 I_com）对比
+    if theta_urdf.size == n_params and n_params == 10 * n_links:
+        urdf_abs = os.path.abspath(urdf_file) if urdf_file else ""
+        parsed_com = _parse_urdf_inertials(urdf_abs) if urdf_abs else {}
+        print("\n  [辨识前] 由 theta_urdf 计算的 I_com 与 URDF 文件中 <inertia>（I_com）对比:")
+        for j in range(n_links):
+            base = 10 * j
+            m_j = float(theta_urdf[base])
+            c_j = np.array([
+                theta_urdf[base + 1] / max(m_j, 1e-12),
+                theta_urdf[base + 2] / max(m_j, 1e-12),
+                theta_urdf[base + 3] / max(m_j, 1e-12),
+            ])
+            I_o = np.array([
+                [theta_urdf[base + 4], theta_urdf[base + 5], theta_urdf[base + 7]],
+                [theta_urdf[base + 5], theta_urdf[base + 6], theta_urdf[base + 8]],
+                [theta_urdf[base + 7], theta_urdf[base + 8], theta_urdf[base + 9]],
+            ], dtype=float)
+            I_com_from_theta = _inertia_origin_to_com(I_o, m_j, c_j)
+            link_name = _joint_name_to_link_name(model.names[j + 1]) if (j + 1) < model.njoints else f"link{j}"
+            file_d = parsed_com.get(link_name) or (parsed_com.get("AR5-5_07R-W4C4A2_" + link_name) if "AR5-5" not in link_name else None)
+            ixx_c, iyy_c, izz_c = I_com_from_theta[0, 0], I_com_from_theta[1, 1], I_com_from_theta[2, 2]
+            ixy_c, ixz_c, iyz_c = I_com_from_theta[0, 1], I_com_from_theta[0, 2], I_com_from_theta[1, 2]
+            if file_d:
+                ixx_f = file_d.get("ixx", float("nan"))
+                iyy_f = file_d.get("iyy", float("nan"))
+                izz_f = file_d.get("izz", float("nan"))
+                ixy_f = file_d.get("ixy", float("nan"))
+                ixz_f = file_d.get("ixz", float("nan"))
+                iyz_f = file_d.get("iyz", float("nan"))
+                print("    连杆{} ({}):".format(j, link_name))
+                print("      I_com(由theta_urdf计算): ixx={:.6e} iyy={:.6e} izz={:.6e} ixy={:.6e} ixz={:.6e} iyz={:.6e}".format(ixx_c, iyy_c, izz_c, ixy_c, ixz_c, iyz_c))
+                print("      I_com(URDF文件):         ixx={:.6e} iyy={:.6e} izz={:.6e} ixy={:.6e} ixz={:.6e} iyz={:.6e}".format(ixx_f, iyy_f, izz_f, ixy_f, ixz_f, iyz_f))
+                print("      差:                      ixx={:.6e} iyy={:.6e} izz={:.6e} ixy={:.6e} ixz={:.6e} iyz={:.6e}".format(
+                    ixx_c - ixx_f, iyy_c - iyy_f, izz_c - izz_f, ixy_c - ixy_f, ixz_c - ixz_f, iyz_c - iyz_f))
+            else:
+                print("    连杆{} ({}): I_com(由theta_urdf计算): ixx={:.6e} iyy={:.6e} izz={:.6e} (URDF中未解析到该link)".format(j, link_name, ixx_c, iyy_c, izz_c))
+
     # 求解 φ = [θ, Fv, Fc]，τ = W*φ
     print("\n========================================")
     print("开始求解动力学参数（含摩擦）...")
@@ -576,38 +953,92 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
     L_diag = np.ones(n_phi) * lam_friction
     L_diag[:n_params] = lam
 
-    # 用 QP+约束 一次得到 φ，θ 满足质量约束，无需后验投影，刚性差从根上避免
+    # 优先 2 次 QP → 单次 QP → Ridge+投影
+    use_two_stage_qp = (
+        cfg.get("use_two_stage_qp", True)
+        and OSQP_AVAILABLE
+        and n_params == 70
+        and theta_urdf.size == n_params
+        and n_links == 7
+    )
     use_qp = (
         OSQP_AVAILABLE
         and n_params == 70
         and theta_urdf.size == n_params
         and n_links == 7
     )
-    if use_qp:
+    phi = None
+    used_constrained_solve = False
+    if use_two_stage_qp:
+        use_i_com_constraint = cfg.get("use_i_com_constraint", True) and CVXPY_AVAILABLE
+        phi, used_i_com_constraint = solve_ridge_two_stage_qp_friction(
+            W_all, tau_all, phi_prior, L_diag, n_params, n_links, m_min,
+            cfg["I_eps"], cfg["I_trace_min"], theta_urdf_fallback=theta_urdf,
+            use_i_com_constraint=use_i_com_constraint,
+        )
+        if phi is not None:
+            used_constrained_solve = True
+            if used_i_com_constraint:
+                print(f"  使用 2 次优化（第1次QP质量约束→第2次SDP 质量+I_com正定约束）求解 φ=[θ,Fv,Fc]: lambda_rel={lambda_rel}, lam_friction={lam_friction:.2e}")
+            else:
+                print(f"  使用 2 次优化（第1次QP→投影→第2次QP，未用I_com约束）求解 φ=[θ,Fv,Fc]: lambda_rel={lambda_rel}, lam_friction={lam_friction:.2e}")
+    if phi is None and use_qp:
         phi = solve_ridge_qp_friction(
             W_all, tau_all, phi_prior, L_diag, n_params, n_links, m_min
         )
-    if not use_qp or phi is None:
+        if phi is not None:
+            used_constrained_solve = True
+            print(f"  使用单次 QP+Ridge（质量约束 θ[10j]>=m_min）求解 φ=[θ,Fv,Fc]: lambda_rel={lambda_rel}, lam_friction={lam_friction:.2e}")
+    if phi is None:
         A_reg = W_all.T @ W_all + np.diag(L_diag)
         b_reg = W_all.T @ tau_all + np.diag(L_diag) @ phi_prior
         phi = np.linalg.solve(A_reg, b_reg)
         print(f"  使用 Ridge 无约束求解 φ=[θ,Fv,Fc]: lambda_rel={lambda_rel}, lam_friction={lam_friction:.2e}")
-    else:
-        print(f"  使用 QP+Ridge（质量约束 θ[10j]>=m_min）求解 φ=[θ,Fv,Fc]: lambda_rel={lambda_rel}, lam_friction={lam_friction:.2e}，无需投影")
 
     theta_estimated = np.asarray(phi[:n_params], dtype=np.float64).copy()
     Fv = np.asarray(phi[n_params : n_params + n_joints], dtype=np.float64)
     Fc = np.asarray(phi[n_params + n_joints : n_phi], dtype=np.float64)
     theta_ls_ridge = theta_estimated.copy()
 
-    # QP 已含质量约束，不再做 project_theta_to_physical，避免投影带来的刚性差
-    if not use_qp and n_params == 70 and theta_urdf.size == n_params:
+    # 不对 θ 做投影，保持计算所得数据；若需投影可设配置 apply_theta_projection: true
+    if cfg.get("apply_theta_projection", False) and not used_constrained_solve and n_params == 70 and theta_urdf.size == n_params:
         fallback = theta_urdf
         project_theta_to_physical(
             theta_estimated, n_params, cfg["m_min"], cfg["I_eps"],
             theta_urdf_fallback=fallback, I_trace_min=cfg["I_trace_min"],
         )
         print("  已应用物理约束投影（无约束求解分支）")
+
+    # 辨识后(84) vs URDF(70) 对比：全部 84 个数据打印（前70=θ，70-76=Fv，77-83=Fc）
+    print("\n  [辨识 vs URDF] 全部 84 个参数对比 (索引 0-69: θ, 70-76: Fv, 77-83: Fc)")
+    for i in range(70):
+        urdf_val = theta_urdf[i] if theta_urdf.size > i else float("nan")
+        est_val = theta_estimated[i]
+        diff_val = est_val - urdf_val if theta_urdf.size > i else float("nan")
+        print(f"    [{i:3d}] theta_urdf={urdf_val:.6e}  theta_est={est_val:.6e}  差={diff_val:.6e}")
+    for j in range(7):
+        print(f"    [{70 + j:3d}] Fv[{j}]={Fv[j]:.6e}")
+    for j in range(7):
+        print(f"    [{77 + j:3d}] Fc[{j}]={Fc[j]:.6e}")
+
+    # 输出 2次QP/约束求解结果：逐连杆 θ 与惯量矩阵，验证正定（Pinocchio 顺序 Ixx,Ixy,Iyy,Ixz,Iyz,Izz）
+    if used_constrained_solve and n_links > 0 and n_params == 10 * n_links:
+        print("\n  [2次QP/约束求解] θ 逐连杆结果（用于写 URDF 的惯量）:")
+        for j in range(n_links):
+            base = 10 * j
+            m = theta_estimated[base]
+            cx = theta_estimated[base + 1] / max(theta_estimated[base], 1e-12)
+            cy = theta_estimated[base + 2] / max(theta_estimated[base], 1e-12)
+            cz = theta_estimated[base + 3] / max(theta_estimated[base], 1e-12)
+            Ixx, Ixy, Iyy = theta_estimated[base + 4], theta_estimated[base + 5], theta_estimated[base + 6]
+            Ixz, Iyz, Izz = theta_estimated[base + 7], theta_estimated[base + 8], theta_estimated[base + 9]
+            I_3x3 = np.array([[Ixx, Ixy, Ixz], [Ixy, Iyy, Iyz], [Ixz, Iyz, Izz]])
+            ev = np.linalg.eigvalsh(I_3x3)
+            pd_ok = np.all(ev >= cfg["I_eps"]) and (Ixx >= cfg["I_eps"] and Iyy >= cfg["I_eps"] and Izz >= cfg["I_eps"])
+            joint_name = model.names[j + 1] if (j + 1) < model.njoints else f"joint_{j+1}"
+            print(f"    连杆{j} ({joint_name}): m={m:.6e}, com=({cx:.4e},{cy:.4e},{cz:.4e})")
+            print(f"      惯量 I_3x3 对角 (Ixx,Iyy,Izz)=({Ixx:.6e}, {Iyy:.6e}, {Izz:.6e})")
+            print(f"      特征值 (ev)=({ev[0]:.6e}, {ev[1]:.6e}, {ev[2]:.6e}), 正定={pd_ok}")
 
     # 训练集误差（Y*θ + 摩擦）
     tau_pred = W_all @ phi
@@ -676,6 +1107,7 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
             for jid in range(1, model.njoints):
                 base = 10 * (jid - 1)
                 pi_id = theta_estimated[base : base + 10]
+                inv_id = pin.Inertia.FromDynamicParameters(pi_id)
                 m_urdf = model.inertias[jid].mass
                 c_urdf = np.array(model.inertias[jid].lever).ravel()
                 m_id = pi_id[0]
@@ -698,7 +1130,35 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
             pf.write(f"  [{tau0[0]:.4f}, {tau0[1]:.4f}, {tau0[2]:.4f}, {tau0[3]:.4f}, {tau0[4]:.4f}, {tau0[5]:.4f}, {tau0[6]:.4f}]\n")
         print(f"  已保存: {phys_path}")
         print("\n  生成新的URDF文件(质心处惯量+摩擦)...")
-        generate_identified_urdf_com(urdf_file, out["output_urdf"], model, theta_estimated, Fv=Fv, Fc=Fc)
+        # 写入前打印：theta_estimated 的 4,6,9 为 I^o（绕原点），写 URDF 时会换算为 I_com
+        t0 = theta_estimated[:10]
+        print(f"  [写入前] theta_estimated link0: m={t0[0]:.6e}, com=({t0[1]/max(t0[0],1e-9):.6f},{t0[2]/max(t0[0],1e-9):.6f},{t0[3]/max(t0[0],1e-9):.6f}), I^o_xx,yy,zz={t0[4]:.6e},{t0[6]:.6e},{t0[9]:.6e}")
+        if used_constrained_solve and np.all(np.array([t0[4], t0[6], t0[9]]) >= cfg["I_eps"]):
+            print("  [写入前] link0 惯量对角元均 >= I_eps，符合约束")
+        elif used_constrained_solve:
+            print("  [写入前] 警告: link0 存在惯量对角元 < I_eps")
+        generate_identified_urdf_com(urdf_file, out["output_urdf"], model, theta_estimated, Fv=Fv, Fc=Fc, I_eps=cfg["I_eps"])
+
+        # 输出后：用写入的 theta_estimated 逐连杆计算质心处惯量 I_com 的正定性（不投影，仅报告）
+        print("\n  [输出 URDF 后] 质心处惯量 I_com 正定性（由 theta_estimated 换算，未做投影）:")
+        for j in range(n_links):
+            base = 10 * j
+            m_j = theta_estimated[base]
+            c_j = np.array([
+                theta_estimated[base + 1] / max(m_j, 1e-12),
+                theta_estimated[base + 2] / max(m_j, 1e-12),
+                theta_estimated[base + 3] / max(m_j, 1e-12),
+            ])
+            I_o = np.array([
+                [theta_estimated[base + 4], theta_estimated[base + 5], theta_estimated[base + 7]],
+                [theta_estimated[base + 5], theta_estimated[base + 6], theta_estimated[base + 8]],
+                [theta_estimated[base + 7], theta_estimated[base + 8], theta_estimated[base + 9]],
+            ], dtype=float)
+            I_com_j = _inertia_origin_to_com(I_o, m_j, c_j)
+            ev = np.linalg.eigvalsh(I_com_j)
+            pd_ok = np.all(ev > 0)
+            link_name = model.names[j + 1] if (j + 1) < model.njoints else f"joint_{j+1}"
+            print(f"    连杆{j} ({link_name}): I_com 特征值=({ev[0]:.6e}, {ev[1]:.6e}, {ev[2]:.6e}), 正定={pd_ok}")
 
     # 验证集用「辨识 URDF」(COM) 的 model 算 Y，使 验证集 RMSE (Y*θ+摩擦) 与 辨识URDF+rnea+摩擦 一致
     model_val = model
@@ -783,10 +1243,29 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
             diff_theta = np.abs(theta_estimated - theta_from_urdf)
             max_diff = np.max(diff_theta)
             mean_diff = np.mean(diff_theta)
-            print("\n  [诊断] θ 写/读一致性: 内存θ vs 保存URDF再读回θ 差异 最大={:.6e}, 平均={:.6e} (应为0)".format(max_diff, mean_diff))
+            print("\n  [诊断] θ 写/读一致性: 写入前(theta_estimated) vs 读回(theta_from_urdf) 差异 最大={:.6e}, 平均={:.6e} (应为0)".format(max_diff, mean_diff))
+            # 读出来后与写入前逐连杆对比并打印
+            n_links_chk = min(7, n_params // 10)
+            for j in range(n_links_chk):
+                base = 10 * j
+                te = theta_estimated[base : base + 10]
+                tu = theta_from_urdf[base : base + 10]
+                m_w, m_r = te[0], tu[0]
+                com_w = (te[1] / max(te[0], 1e-12), te[2] / max(te[0], 1e-12), te[3] / max(te[0], 1e-12))
+                com_r = (tu[1] / max(tu[0], 1e-12), tu[2] / max(tu[0], 1e-12), tu[3] / max(tu[0], 1e-12))
+                Ixx_w, Iyy_w, Izz_w = te[4], te[6], te[9]
+                Ixx_r, Iyy_r, Izz_r = tu[4], tu[6], tu[9]
+                print("  [诊断] 连杆{} 写入前 vs 读回: m {:.6e} vs {:.6e} | com ({:.6e},{:.6e},{:.6e}) vs ({:.6e},{:.6e},{:.6e}) | Ixx {:.6e} vs {:.6e} | Iyy {:.6e} vs {:.6e} | Izz {:.6e} vs {:.6e}".format(
+                    j, m_w, m_r,
+                    com_w[0], com_w[1], com_w[2], com_r[0], com_r[1], com_r[2],
+                    Ixx_w, Ixx_r, Iyy_w, Iyy_r, Izz_w, Izz_r))
+                print("         差异: |m|={:.4e} |com|_max={:.4e} |Ixx|={:.4e} |Iyy|={:.4e} |Izz|={:.4e}".format(
+                    abs(m_w - m_r),
+                    max(abs(com_w[0] - com_r[0]), abs(com_w[1] - com_r[1]), abs(com_w[2] - com_r[2])),
+                    abs(Ixx_w - Ixx_r), abs(Iyy_w - Iyy_r), abs(Izz_w - Izz_r)))
             # 逐元素一一对应打印: 索引 关节 参数名 内存θ URDF读回θ |差|
-            param_names = ["m", "mc_x", "mc_y", "mc_z", "I_xx", "I_xy", "I_xz", "I_yy", "I_yz", "I_zz"]
-            print("  [诊断] θ 逐元素对比 (idx 关节 参数    内存θ            URDF读回θ        |差|):")
+            param_names = ["m", "mc_x", "mc_y", "mc_z", "I_xx", "I_xy", "I_yy", "I_xz", "I_yz", "I_zz"]
+            print("  [诊断] θ 逐元素对比 (idx 关节 参数    写入前(theta)   读回(URDF)      |差|):")
             # for i in range(n_params):
             #     jid = i // 10
             #     pname = param_names[i % 10]
@@ -946,12 +1425,12 @@ def estimate_dynamics_parameters(data_file: str, urdf_file: str, cfg: dict) -> N
                 tau_Yfric_2d = tau_val_pred[: n_val * 7].reshape(n_val, 7)
                 tau_rnea_2d = np.array(tau_pred_list[: n_val * 7]).reshape(n_val, 7)
                 tau_rnea_fric_2d = np.array(tau_pred_fric_list[: n_val * 7]).reshape(n_val, 7)
-                # 关键: Y*θ 用 theta_estimated(投影后)，W_val@phi 用 phi[:n_params](Ridge 未投影)，故 摩擦(Y*θ)=摩擦_纯 + 刚性差
+                # 关键: Y*θ 用 theta_estimated，W_val@phi 用 phi[:n_params](Ridge 解)，故 摩擦(Y*θ)=摩擦_纯 + 刚性差
                 tau_Y_ridge_2d = (Y_val @ phi[:n_params])[: n_val * 7].reshape(n_val, 7)
                 fric_pure_Y_2d = tau_Yfric_2d - tau_Y_ridge_2d  # 回归中纯摩擦 = (W@φ) - (Y@φ[:70])
                 theta_diff = np.abs(phi[:n_params] - theta_estimated)
                 print("\n  ---------- 调试: Y*θ+摩擦 vs 辨识URDF[COM]+rnea+摩擦 ----------")
-                print("  [诊断] φ[:n_params] 与 theta_estimated(投影后) 差: 最大={:.6e}, 均值={:.6e} (非零说明 摩擦(Y*θ) 含刚性差)".format(np.max(theta_diff), np.mean(theta_diff)))
+                print("  [诊断] φ[:n_params] 与 theta_estimated 差: 最大={:.6e}, 均值={:.6e} (非零说明 摩擦(Y*θ) 含刚性差)".format(np.max(theta_diff), np.mean(theta_diff)))
                 rmse_Yfric_per_j = np.sqrt(np.mean((tau_meas_2d - tau_Yfric_2d) ** 2, axis=0))
                 rmse_rnea_fric_per_j = np.sqrt(np.mean((tau_meas_2d - tau_rnea_fric_2d) ** 2, axis=0))
                 # rnea + 摩擦(Y路) 应与 Y*θ+摩擦 一致

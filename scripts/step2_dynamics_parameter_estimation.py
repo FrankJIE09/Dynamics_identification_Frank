@@ -62,7 +62,7 @@ def _find_config_path():
 def load_config(config_path: str | None) -> dict:
     cfg = {
         "data_file": "../src/config/dynamics_identification_data.csv",
-        "urdf_file": "../urdf/AR5-5_07R-W4C4A2_Manual_fix.urdf",
+        "urdf_file": "scripts/AR5-5_07R-W4C4A2/AR5-5_07R-W4C4A2.urdf",
         "lambda_rel": 1e-3,
         "m_min": 1e-4,
         "I_eps": 1e-6,
